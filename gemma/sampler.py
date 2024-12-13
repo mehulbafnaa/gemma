@@ -88,6 +88,10 @@ class _SamplingState:
   # List of tokens that are forbidden to be generated.
   forbidden_token_ids: Sequence[int] | None = None
 
+  use_adaptive_temp: bool = False
+
+  temp_poly_fit: jnp.ndarray | None = None 
+
 
 @dataclasses.dataclass
 class SamplerOutput:
@@ -110,6 +114,7 @@ class Sampler:
       transformer: transformer_lib.Transformer,
       vocab: spm.SentencePieceProcessor,
       params: params_lib.Params,
+      use_adaptive_temperature: bool = False,
   ):
     """Initializes a sampler for a Gemma model.
 
@@ -121,6 +126,7 @@ class Sampler:
     self.transformer = transformer
     self.vocab = vocab
     self.params = params
+    self.use_adaptive_temperature = use_adaptive_temperature
     self._compiled_sample_fn = jax.jit(self._sample_fn)
 
   @property
