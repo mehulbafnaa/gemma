@@ -19,14 +19,16 @@ from __future__ import annotations
 import dataclasses
 import functools
 import typing
-from typing import Any, ClassVar
+from typing import Any, ClassVar, List
 
 import einops
 import flax
 from flax import linen as nn
-from gemma.gm.nn import _config
-from gemma.gm.nn import _layers
-from gemma.gm.nn import _modules
+from gemma.gm.math import _pos_utils
+from gemma.gm.nn import _transformer
+from gemma.gm.nn.gemma3n import _config
+from gemma.gm.nn.gemma3n import _layers
+from gemma.gm.nn.gemma3n import _modules
 from gemma.gm.utils import _dtype_params
 from gemma.gm.utils import _jax_utils
 from gemma.gm.utils import _types
@@ -76,16 +78,18 @@ class _Inputs:
     positions: Input absolute positions.
     attention_mask: Transformer input mask.
     inputs_mask: Mask of the input tokens.
+    per_layer_inputs: Per-layer inputs, if used in model.
   """
 
   embeddings: Float['B L D']
   positions: Int['B L']
   attention_mask: Bool['B L cache_length']
   inputs_mask: Bool['B L']
+  per_layer_inputs: Float['B L P'] | None = None
 
 
-class Transformer(nn.Module):
-  """Base transformer class.
+class Gemma3nTransformer(_transformer.Transformer):
+  """Gemma3n transformer class.
 
   Attributes:
     return_last_only: If `True`, only compute and return the last token.
@@ -117,6 +121,14 @@ class Transformer(nn.Module):
         vision_proj_dim=self.config.vision_encoder.siglip_encoder.width
         if self.config.vision_encoder
         else None,
+        num_layers=self.config.num_layers,
+        per_layer_input_dim=self.config.per_layer_input_dim,
+    )
+
+    self.kv_cache_sharing_patterns = _config.create_kv_cache_sharing_patterns(
+        self.config.kv_cache_sharing_config,
+        self.config.num_layers,
+        self.config.attention_types,
     )
 
     self.blocks = [
@@ -135,20 +147,51 @@ class Transformer(nn.Module):
             query_pre_attn_scalar=self.config.query_pre_attn_scalar(),
             transpose_gating_einsum=self.config.transpose_gating_einsum,
             use_qk_norm=self.config.use_qk_norm,
+            qk_norm_with_scale=self.config.qk_norm_with_scale,
+            use_value_norm=self.config.use_value_norm,
             rope_base_frequency=self.config.local_base_frequency
             if attn_type == _modules.AttentionType.LOCAL_SLIDING
             else self.config.global_base_frequency,
             rope_scale_factor=self.config.local_scale_factor
             if attn_type == _modules.AttentionType.LOCAL_SLIDING
             else self.config.global_scale_factor,
+            use_altup=self.config.use_altup,
+            num_altup_inputs=self.config.num_altup_inputs,
+            altup_coef_clip=self.config.altup_coef_clip,
+            activation_sparsity=(
+                self.config.activation_sparsity_pattern[i]
+                if self.config.activation_sparsity_pattern is not None
+                else None),
+            use_laurel=self.config.use_laurel,
+            laurel_rank=self.config.laurel_rank,
+            per_layer_input_dim=self.config.per_layer_input_dim,
+            scale_plus_one=self.config.scale_plus_one,
+            guard_against_excess_precision=self.config.guard_against_excess_precision,
+            sliding_mask_type=self.config.sliding_mask_type,
         )
         for i, attn_type in zip(
             range(self.config.num_layers), self.config.attention_types
         )
     ]
-    self.final_norm = _layers.RMSNorm()
+    self.final_norm = _layers.RMSNorm(
+        scale_plus_one=self.config.scale_plus_one,
+        guard_against_excess_precision=self.config.guard_against_excess_precision,
+    )
 
     self.vision_encoder = self.config.vision_encoder
+    if self.config.use_altup:
+      self.altup_projection = [
+          _layers.Einsum(
+              shape=(self.config.embed_dim, self.config.embed_dim),
+              weight_name=f'altup_projection_{i}',
+          ) for i in range(self.config.num_altup_inputs - 1)
+      ]
+      self.altup_unembed_projection = [
+          _layers.Einsum(
+              shape=(self.config.embed_dim, self.config.embed_dim),
+              weight_name=f'altup_unembed_projection_{i}',
+          ) for i in range(self.config.num_altup_inputs - 1)
+      ]
 
   if not typing.TYPE_CHECKING:
 
@@ -185,14 +228,13 @@ class Transformer(nn.Module):
       *,
       images: UInt8['*B N H W C'] | UInt8['*B H W C'] | None = None,
       # TODO(epot): Cleanup and simplify the API.
-      # When provided, the positions and attention_mask should include
-      # the extra inserted multi-modal tokens.
-      positions: Int['*B L_with_mm'] | None = None,
+      positions: Int['*B L'] | None = None,
+      positions_offset: Int['*B'] | None = None,
       cache: _config.Cache | None = None,
       # During training and pre-filling, the attention mask is `*B L L`
       # When sampling (after prefilling), tokens are decoded one by one,
       # so the attention mask is `*B 1 cache_length`
-      attention_mask: Bool['*B L_with_mm cache_length'] | None = None,
+      attention_mask: Bool['*B L cache_length'] | None = None,
       return_last_only: bool | None = None,
       return_hidden_states: bool | None = None,
   ) -> Output:  # Output['*B']
@@ -205,6 +247,8 @@ class Transformer(nn.Module):
       tokens: input sequence of tokens.
       images: Images to feed to the vision encoder.
       positions: input absolute positions.
+      positions_offset: Offset to add to the positions. Used for multi-turn when
+        the cache is provided and `positions` is None.
       cache: Attention KV cache or None.
       attention_mask: transformer input mask.
       return_last_only: If `True`, only compute and return the logits of the
@@ -234,30 +278,45 @@ class Transformer(nn.Module):
             'lora',
         ],
     ):
-
       # Encode the text tokens, eventually including the vision embeddings.
       inputs = self._encode_and_get_inputs(
           tokens=tokens,
           images=images,
           positions=positions,
+          positions_offset=positions_offset,
           attention_mask=attention_mask,
       )
       del positions, attention_mask
 
       x = inputs.embeddings
+      per_layer_inputs = inputs.per_layer_inputs
+      x = self._maybe_preprocess_embeddings_with_altup(x)
 
       old_cache = cache or {}
       new_cache = {}
       for i, block in enumerate(self.blocks):
         layer_name = f'layer_{i}'
+        kv_shared_cache = None
+        if (
+            self.config.kv_cache_sharing_config is not None
+            and self.kv_cache_sharing_patterns is not None
+            and i != self.kv_cache_sharing_patterns[i]
+        ):
+          shared_layer_name = f'layer_{self.kv_cache_sharing_patterns[i]}'
+          kv_shared_cache = new_cache.get(shared_layer_name)
         layer_cache, x = block(
             x,
             inputs.positions,
             old_cache.get(layer_name),
             inputs.attention_mask,
+            per_layer_input=per_layer_inputs[..., i, :]
+            if self.config.per_layer_input_dim
+            else None,
+            kv_shared_cache=kv_shared_cache,
         )
         new_cache[layer_name] = layer_cache  # pytype: disable=container-type-mismatch
 
+      x = self._maybe_postprocess_embeddings_with_altup(x)
       x = self.final_norm(x)
 
     if return_last_only:
@@ -317,8 +376,9 @@ class Transformer(nn.Module):
       *,
       tokens: Int['B L_no_mm'],
       images: UInt8['B H W C'] | UInt8['B N H W C'] | None = None,
-      attention_mask: Bool['B L_with_mm cache_length'] | None = None,
-      positions: Int['B L_with_mm'] | None = None,
+      attention_mask: Bool['B L_no_mm cache_length'] | None = None,
+      positions: Int['B L_no_mm'] | None = None,
+      positions_offset: Int['B'] | None = None,
   ) -> _Inputs:
     """Encode the text tokens, eventually including the vision embeddings."""
 
@@ -352,12 +412,23 @@ class Transformer(nn.Module):
       # params are correctly initialized.
       _ = self._encode_vision(_make_dummy_images(self.vision_encoder))
 
+    if self.config.per_layer_input_dim:
+      per_layer_inputs = self.embedder.encode_per_layer_input(
+          x, inputs.tokens_with_mm
+      )
+    else:
+      per_layer_inputs = None
+
     # Note: When `positions` and `attention_mask` are explicitly provided,
     # it's the user responsibility to correctly take into account the extra
     # tokens inserted for the images.
     # This is what the `gm.text.Sampler` implementation does.
     if positions is None:
-      positions = inputs.positions
+      positions = _pos_utils.build_positions_from_mask(inputs.inputs_mask)
+      # For multi-turn, during the pre-fill phase, the positions should be
+      # shifted to take into account the previous turns.
+      if positions_offset is not None:
+        positions += positions_offset[..., None]
 
     if attention_mask is None:
       attention_mask = inputs.attention_mask
@@ -367,6 +438,7 @@ class Transformer(nn.Module):
         positions=positions,
         attention_mask=attention_mask,
         inputs_mask=inputs.inputs_mask,
+        per_layer_inputs=per_layer_inputs,
     )
 
   @typechecked
@@ -419,6 +491,37 @@ class Transformer(nn.Module):
           ' yet images are provided.'
           + msg
       )
+
+  def _maybe_preprocess_embeddings_with_altup(
+      self,
+      x: Float['*B L D'],
+      guard_against_excess_precision: bool = True,
+  ) -> Float['*B L D'] | List[Float['*B L D']]:
+    if self.config.use_altup:
+      eq = '...F,FD->...D'
+      target_magnitude = jnp.mean(x**2, axis=-1, keepdims=True) ** 0.5
+      x = [x] * self.config.num_altup_inputs
+      for i in range(1, self.config.num_altup_inputs):
+        x[i] = self.altup_projection[i-1](eq, x[i]).astype(x[0].dtype)
+        new_magnitude = jnp.mean(x[i]**2, axis=-1, keepdims=True) ** 0.5
+        x[i] *= target_magnitude / jnp.maximum(new_magnitude, 1e-12)
+      if guard_against_excess_precision:
+        x[0] = _layers.reduce_precision(x[0])
+    return x
+
+  def _maybe_postprocess_embeddings_with_altup(
+      self,
+      x: Float['*B L D'] | List[Float['*B L D']],
+  ) -> Float['*B L D']:
+    if self.config.use_altup:
+      eq = '...F,FD->...D'
+      target_magnitude = jnp.mean(x[0]**2, axis=-1, keepdims=True) ** 0.5
+      for i in range(1, self.config.num_altup_inputs):
+        x[i] = self.altup_unembed_projection[i-1](eq, x[i]).astype(x[0].dtype)
+        new_magnitude = jnp.mean(x[i]**2, axis=-1, keepdims=True) ** 0.5
+        x[i] *= target_magnitude / jnp.maximum(new_magnitude, 1e-12)
+      x = jnp.mean(jnp.stack(x, axis=0), axis=0)
+    return x  # pytype: disable=bad-return-type
 
 
 def _make_dummy_images(

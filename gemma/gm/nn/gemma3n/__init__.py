@@ -12,20 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tools."""
+"""Gemma models."""
 
-# pylint: disable=g-import-not-at-top,g-importing-member,g-bad-import-order
+# pylint: disable=g-importing-member,g-import-not-at-top
 
-# Tool handler
-from gemma.gm.tools._manager import ToolManagerBase
-from gemma.gm.tools._manager import OneShotToolManager
+from etils import epy as _epy
 
-# API to build new tools
-from gemma.gm.tools._tools import Tool
-from gemma.gm.tools._tools import ToolOutput
-from gemma.gm.tools._tools import Example
 
-# Available tools (mostly for demo purposes)
-from gemma.gm.tools._calculator import Calculator
-from gemma.gm.tools._file_explorer import FileExplorer
-from gemma.gm.tools._offline_tool_search import OfflineToolSearch
+with _epy.lazy_api_imports(globals()):
+  # Gemma 3n
+  from gemma.gm.nn.gemma3n._gemma3n import Gemma3n_E2B
+  from gemma.gm.nn.gemma3n._gemma3n import Gemma3n_E4B
