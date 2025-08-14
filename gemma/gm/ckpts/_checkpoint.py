@@ -25,6 +25,7 @@ import typing
 from typing import Any, TypeVar
 
 from etils import epath
+from etils.etree import jax as etree  # pylint: disable=g-importing-member
 import flax
 from gemma.gm.ckpts import _compat
 from gemma.gm.ckpts import _quantization
@@ -146,7 +147,7 @@ class _CheckpointTree:
       # Unflatten the params structure
       target_params = _nested_to_flat(ckpt_params)
     elif self.type == _CheckpointType.KAULDRON:
-      target_params = _copy(metadata.tree)
+      target_params = etree.copy(metadata.tree)
       target_params['params'] = ckpt_params
     else:
       raise ValueError(f'Unsupported checkpoint structure: {self.type}')
@@ -180,6 +181,7 @@ def load_params(
     text_only: bool = False,
     sharding: kd.sharding.ShardingTree | None = None,
     quantize: bool = False,
+    use_ocdbt: bool = True,
 ) -> Params:
   """Restore the params from a checkpoint.
 
@@ -195,6 +197,7 @@ def load_params(
       is mutually exclusive with `params`.
     quantize: If `True`, the params will be mapped to enable quantization aware
       training.
+    use_ocdbt: Whether to enable Tensorstore OCDBT driver.
 
   Returns:
     The restored params.
@@ -202,7 +205,7 @@ def load_params(
   if sharding is not None and params is not None:
     raise ValueError('`sharding` and `params` are mutually exclusive.')
 
-  ckpt = ocp.StandardCheckpointer()
+  ckpt = ocp.StandardCheckpointer(use_ocdbt=use_ocdbt)
 
   metadata, path = _get_metadata_and_path(ckpt, path)
 
@@ -282,7 +285,7 @@ def load_params(
 
 def _flat_to_nested(params: Params) -> Params:
   """Reformat the params from FLAT to NESTED."""
-  params = _copy(params)
+  params = etree.copy(params)
   # Split the params for the MM and the transformer.
   transformer_params = {
       k: v for k, v in params.items() if k.startswith('transformer/')
@@ -303,7 +306,7 @@ def _flat_to_nested(params: Params) -> Params:
 
 def _nested_to_flat(params: Params) -> Params:
   """Reformat the params from NESTED to FLAT."""
-  params = _copy(params)  # Copy to allow mutating the tree.
+  params = etree.copy(params)  # Copy to allow mutating the tree.
 
   mm_params = params.pop('vision_encoder', {})
   if mm_params:
@@ -331,7 +334,7 @@ def _flat_to_nested_single(params: Params, *, name: str) -> Params:
 def _remove_mm_params(params):
   """Remove the MM params."""
   # Copy to allow mutating the tree.
-  params = _copy(params)
+  params = etree.copy(params)
 
   # TODO(epot): Once orbax supports partial restore, we would not need to
   # load those extra params in the first place.
@@ -344,7 +347,7 @@ def _remove_mm_params(params):
 
 def _add_skip_mm_params(params: Params, metadata: _CheckpointTree) -> Params:
   """Add skip MM params to restore."""
-  params = _copy(params)
+  params = etree.copy(params)
   params_with_mm = metadata.nested_tree
 
   # Params should not be restored in the first place.
@@ -423,10 +426,6 @@ def _release_memory(x):
   if isinstance(x, jax.Array):
     x.delete()
   return x
-
-
-def _copy(tree):
-  return jax.tree.map(lambda x: x, tree)
 
 
 def _get_metadata_and_path(
