@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -74,107 +74,58 @@ def test_embedder_decode():
 # TODO(mblondel): Add tests for `encode_vision` here.
 
 
-def test_create_sliding_mask_decode_none_rotated_cache_pos():
-  cache_len = 4
-  end_index = 1
-  segment_pos = jnp.array([[1]])
+def test_sliding_mask():
 
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=1
+  # Simple case
+  sliding_mask = _modules.create_sliding_mask(
+      positions=jnp.array([[0, 1, 2, 3, 4, 5]]),
+      sliding_window_size=2,
   )
   np.testing.assert_array_equal(
       sliding_mask,
-      [[[False, True, False, False]]],
-  )
-
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=2
-  )
-  np.testing.assert_array_equal(
-      sliding_mask,
-      [[[True, True, True, False]]],
-  )
-
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=3
-  )
-  np.testing.assert_array_equal(
-      sliding_mask,
-      [[[True, True, True, True]]],
-  )
-
-
-def test_create_sliding_mask_decode_rotated_cache_pos():
-  cache_len = 4
-  end_index = 5
-  segment_pos = jnp.array([[5]])
-
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=1
-  )
-  np.testing.assert_array_equal(
-      sliding_mask,
-      # cache_positions = [
-      #   4,      5,     2,     3,
-      # ]
-      [[[False, True, False, False]]],
-  )
-
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=2
-  )
-  np.testing.assert_array_equal(
-      sliding_mask,
-      [[[True, True, False, False]]],
-  )
-
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=3
-  )
-  np.testing.assert_array_equal(
-      sliding_mask,
-      [[[True, True, False, True]]],
-  )
-
-
-def test_create_sliding_mask_prefill_rotated_cache_pos():
-  cache_len = 4
-  end_index = 5
-  segment_pos = jnp.array([[5, 6]])
-
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=1
-  )
-  np.testing.assert_array_equal(
-      sliding_mask,
-      # cache_positions = [
-      #   4,      5,     6,     3,
-      # ]
       [[
-          [False, True, False, False],
-          [False, False, True, False],
+          [1, 1, 0, 0, 0, 0],
+          [1, 1, 1, 0, 0, 0],
+          [0, 1, 1, 1, 0, 0],
+          [0, 0, 1, 1, 1, 0],
+          [0, 0, 0, 1, 1, 1],
+          [0, 0, 0, 0, 1, 1],
       ]],
   )
 
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=2
+  # With packed sequences
+  sliding_mask = _modules.create_sliding_mask(
+      positions=jnp.array([[0, 1, 2, 3, 0, 1, 2]]),
+      sliding_window_size=2,
   )
   np.testing.assert_array_equal(
       sliding_mask,
       [[
-          [True, True, True, False],
-          [False, True, True, False],
+          [1, 1, 0, 0, 1, 1, 0],
+          [1, 1, 1, 0, 1, 1, 1],
+          [0, 1, 1, 1, 0, 1, 1],
+          [0, 0, 1, 1, 0, 0, 1],
+          [1, 1, 0, 0, 1, 1, 0],
+          [1, 1, 1, 0, 1, 1, 1],
+          [0, 1, 1, 1, 0, 1, 1],
       ]],
   )
 
-  sliding_mask = _modules._create_sliding_mask(
-      segment_pos, end_index, cache_len, sliding_window_size=3
+  # With padded cache
+  sliding_mask = _modules.create_sliding_mask(
+      positions=jnp.array([[4, 5, 6]]),
+      cache_positions=jnp.array([[0, 0, 0, 1, 2, 3]]),
+      sliding_window_size=3,
   )
   np.testing.assert_array_equal(
       sliding_mask,
       [[
-          [True, True, True, True],
-          [True, True, True, False],
+          [0, 0, 0, 0, 1, 1],
+          [0, 0, 0, 0, 0, 1],
+          # Note in this case, the token position 6 cannot attend to any
+          # position in the cache. This would create issue. But in practice,
+          # we decode one token at a time.
+          [0, 0, 0, 0, 0, 0],
       ]],
   )
 
@@ -223,7 +174,7 @@ def _get_attn_output(
   params = attn.init(rng, x, segment_pos, cache, attn_mask)
   cache, output = attn.apply(params, x, segment_pos, cache, attn_mask)
 
-  return cache, output
+  return cache, output  # pyrefly: ignore[bad-return]
 
 
 def test_attention():
@@ -324,7 +275,7 @@ def test_sliding_window():
       params, x, segment_pos, cache, attn_mask
   )
 
-  assert not (output == sliding_output).all()
+  assert not (output == sliding_output).all()  # pyrefly: ignore[missing-attribute]
 
 
 def test_query_pre_attn_scalar_modifies_output():
@@ -446,7 +397,7 @@ def test_ffw(transpose_gating_einsum: bool):
   outputs = ffw.apply({'params': params}, inputs)
 
   expected_shape = (batch_size, seq_len, features)
-  assert outputs.shape == expected_shape
+  assert outputs.shape == expected_shape  # pyrefly: ignore[missing-attribute]
 
 
 @pytest.mark.parametrize(
@@ -468,7 +419,7 @@ def test_ffw_grad(transpose_gating_einsum: bool, expected_grad: list[float]):
       transpose_gating_einsum=transpose_gating_einsum,
   )
   loss = lambda params, inputs: jnp.square(
-      ffw.apply(params, inputs) - jnp.ones((batch_size, 1, features))
+      ffw.apply(params, inputs) - jnp.ones((batch_size, 1, features))  # pyrefly: ignore[unsupported-operation]
   ).mean()
 
   params = ffw.init(jax.random.PRNGKey(0), inputs)
@@ -486,7 +437,7 @@ def test_block():
   seq_len = 1
 
   inputs = jnp.ones((batch_size, seq_len, embed_dim))
-  positions = jnp.zeros((batch_size, seq_len))
+  positions = jnp.zeros((batch_size, seq_len), dtype=jnp.int32)
 
   # Initialize cache.
   cache = gm.nn.Attention.init_cache(
@@ -516,7 +467,7 @@ def test_block():
       transpose_gating_einsum=False,
   )
 
-  attn_mask = jnp.ones((batch_size, seq_len, cache_size))
+  attn_mask = jnp.ones((batch_size, seq_len, cache_size), dtype=jnp.bool_)
   params = block.init(
       jax.random.PRNGKey(0), inputs, positions, cache, attn_mask
   )

@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ def test_einsum(inputs_shape, params_shape, eqn, expected_shape):
       eqn,
       jnp.ones(inputs_shape),
   )
-  assert output.shape == expected_shape
+  assert output.shape == expected_shape  # pyrefly: ignore[missing-attribute]
 
 
 @pytest.mark.parametrize(

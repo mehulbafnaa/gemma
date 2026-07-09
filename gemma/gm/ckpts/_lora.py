@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,20 +34,20 @@ else:
 
 
 @dataclasses.dataclass(frozen=True)
-class SkipLoRA(kd.ckpts.AbstractPartialLoader):
+class SkipLoRA(kd.ckpts.InitTransform):
   """Wraps a partial loader to not restore the LoRA weights."""
 
-  wrapped: kd.ckpts.AbstractPartialLoader
+  wrapped: kd.ckpts.InitTransform
 
   def transform(self, state: _StateT) -> _StateT:  # pytype: disable=signature-mismatch
     # Remove the LoRA weights from the params structure so it can be restored
-    original_params, lora_params = peft.split_params(state.params)
+    original_params, lora_params = peft.split_params(state.params)  # pyrefly: ignore[bad-argument-type]
 
-    state = state.replace(params=original_params)
+    state = state.replace(params=original_params)  # pyrefly: ignore[bad-assignment]
 
     state = self.wrapped.transform(state)
 
     # Restore the LoRA weights
-    state = state.replace(params=peft.merge_params(state.params, lora_params))
+    state = state.replace(params=peft.merge_params(state.params, lora_params))  # pyrefly: ignore[bad-argument-type, bad-assignment]
 
     return state

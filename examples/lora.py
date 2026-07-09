@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -145,7 +145,7 @@ def _make_dataset(
               out_target_mask="loss_mask",
               tokenizer=tokenizer,
               # Padding parameters
-              max_length=None if sampling else max_length,
+              max_length=None if sampling else max_length,  # pyrefly: ignore[bad-argument-type]
               # In this dataset, ~1% of examples are longer than 512 tokens.
               truncate=True,
               sampling=sampling,

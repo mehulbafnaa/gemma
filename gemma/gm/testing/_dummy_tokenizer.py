@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ else:
   _base_cls = ()
 
 
-class _DummySentencePieceProcessor(*_base_cls):
+class _DummySentencePieceProcessor(*_base_cls):  # pyrefly: ignore[invalid-inheritance]
   """Dummy tokenizer."""
 
   def __init__(self):

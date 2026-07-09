@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,9 +21,10 @@ import random as py_random
 import typing
 from typing import Literal
 
+import dialog
 from etils import enp
 from gemma.gm.data import _functional
-from gemma.gm.nn import _transformer
+from gemma.gm.nn import _transformer_like
 from gemma.gm.text import _prefill
 from gemma.gm.text import _sampler_loop
 from gemma.gm.text import _sampling
@@ -33,7 +34,8 @@ from gemma.gm.utils import _types
 import jax
 import jax.numpy as jnp
 from kauldron import kd
-from kauldron.typing import Array, Float, Int, PRNGKey, PRNGKeyLike, UInt8  # pylint: disable=g-multiple-import,g-importing-member
+from kauldron.ktyping import Array, Float, PRNGKey, Int, UInt8  # pylint: disable=g-multiple-import,g-importing-member
+from kauldron.typing import PRNGKeyLike  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
 
 
@@ -42,6 +44,14 @@ import numpy as np
 #   so the same data pipeline can be used for both training and sampling.
 # * Mode which queue the prompts and compute them asynchronously ?
 # * Mode which yields tokens as they get predicted ?
+
+type _Prompt = (
+    # Prompts can be:
+    str
+    | Sequence[str]
+    | dialog.Conversation
+    | Sequence[dialog.Conversation]
+)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -57,7 +67,7 @@ class SamplerOutput:
   state: _sampler_loop.SamplingState
 
   @property
-  def tokens(self) -> Int['B L'] | Int['L']:
+  def tokens(self) -> Int['B L'] | Int['L']:  # pyrefly: ignore[unknown-name]
     """Predicted tokens."""
     return self._maybe_unbatch(self.state.predicted_tokens)
 
@@ -66,7 +76,7 @@ class SamplerOutput:
   #   """Logits of the predicted tokens."""
   #   return self._maybe_unbatch(self.state.predicted_logits)
 
-  def _maybe_unbatch(self, x: Array['B *d']) -> Float['*d']:
+  def _maybe_unbatch(self, x: Array['B *d']) -> Float['*d']:  # pyrefly: ignore[not-a-type, unknown-name]
     if isinstance(self.text, str):
       (x,) = x
     return x
@@ -115,7 +125,7 @@ class Sampler:
   """
   # pylint: enable=g-docstring-quotes
 
-  model: _transformer.Transformer
+  model: _transformer_like.TransformerLike
   params: _common.Params
   tokenizer: _tokenizer.Tokenizer = None  # pytype: disable=annotation-type-mismatch
   sampling: _sampling.SamplingMethod = dataclasses.field(
@@ -156,9 +166,9 @@ class Sampler:
 
   # Unbatched version (`str -> str`)
   @typing.overload
-  def sample(
+  def sample(  # pyrefly: ignore[inconsistent-overload-default]
       self,
-      prompt: str,
+      prompt: str | dialog.Conversation,
       *,
       images: UInt8['N? H W C'] | None = ...,
       max_new_tokens: int | None = ...,
@@ -167,7 +177,7 @@ class Sampler:
       rng: PRNGKeyLike | None = ...,
       return_state: Literal[False] = ...,
       last_state: _sampler_loop.SamplingState | None = ...,
-      sharding: kd.sharding.ShardingTree | None = ...,
+      sharding: kd.sharding.ShardingTree | None = ...,  # pyrefly: ignore[not-a-type]
   ) -> str:
     ...
 
@@ -175,16 +185,16 @@ class Sampler:
   @typing.overload
   def sample(
       self,
-      prompt: Sequence[str],
+      prompt: Sequence[str | dialog.Conversation],
       *,
-      images: Sequence[UInt8['N H W C']] | None = ...,
+      images: Sequence[UInt8['N H W C']] | None = ...,  # pyrefly: ignore[not-a-type]
       max_new_tokens: int | None = ...,
       stream: Literal[False] = ...,
       sampling: _sampling.SamplingMethod = ...,
       rng: PRNGKeyLike | None = ...,
       return_state: Literal[False] = ...,
       last_state: _sampler_loop.SamplingState | None = ...,
-      sharding: kd.sharding.ShardingTree | None = ...,
+      sharding: kd.sharding.ShardingTree | None = ...,  # pyrefly: ignore[not-a-type]
   ) -> list[str]:
     ...
 
@@ -193,7 +203,7 @@ class Sampler:
   @typing.overload
   def sample(
       self,
-      prompt: str | Sequence[str],
+      prompt: _Prompt,
       *,
       images: UInt8['B? N? H W C'] | None = ...,
       max_new_tokens: int | None = ...,
@@ -202,7 +212,7 @@ class Sampler:
       rng: PRNGKeyLike | None = ...,
       return_state: Literal[True] = ...,
       last_state: _sampler_loop.SamplingState | None = ...,
-      sharding: kd.sharding.ShardingTree | None = ...,
+      sharding: kd.sharding.ShardingTree | None = ...,  # pyrefly: ignore[not-a-type]
   ) -> SamplerOutput:
     ...
 
@@ -258,8 +268,8 @@ class Sampler:
     ```
 
     Args:
-      prompt: Prompt to sample from. Can be a single string or a list of
-        strings.
+      prompt: Prompt(s) to sample from. Can be a single string or
+        `dialog.Conversation` or a list of those.
       images: Images for the prompt. The position where the image should be
         inserted in the prompt is determined by the `<start_of_image>` token in
         the prompt.
@@ -285,6 +295,8 @@ class Sampler:
       The sampled output.
     '''
 
+    # TODO(epot): Supports list[dialog.Conversation] | dialog.Conversation
+
     # pylint: enable=g-docstring-quotes
     sampling = sampling or self.sampling
 
@@ -292,11 +304,6 @@ class Sampler:
     rng = _normalize_rng(rng)
 
     has_batch_dim = _get_has_batch_dim(prompt)
-    if stream and has_batch_dim:
-      raise ValueError(
-          'Streaming is not supported for batched prompts. Let us know if you'
-          ' need this feature.'
-      )
 
     # Normalize the text, images. Tokenize, shard,...
     inputs = self._get_inputs(
@@ -335,19 +342,7 @@ class Sampler:
 
     # TODO(epot): Donate the `init_state`, `last_state`
 
-    sampler = _sampler_loop.SamplerLoop(
-        # Static attributes. Changing those will trigger a recompilation.
-        model=self.model,
-        end_tokens=(
-            self.tokenizer.special_tokens.EOS,
-            self.tokenizer.special_tokens.END_OF_TURN,
-            *self._normalized_stop_tokens,
-        ),
-        forbidden_tokens=self._normalized_forbidden_tokens,
-        sampling=sampling,
-        cache_length=self.cache_length,
-        special_tokens=self.tokenizer.special_tokens,
-    )
+    sampler = self._initialize_sampler_loop(sampling)
 
     # TODO(epot): Use `jnp.cond` to detect when the cache is full (or use
     # rolling-cache). Also do add a check that the cache wasn't filled up
@@ -363,16 +358,34 @@ class Sampler:
 
     if stream:
       return self._stream_decode_state(  # pytype: disable=bad-return-type
-          state,
+          state,  # pyrefly: ignore[bad-argument-type]
           return_state=return_state,
+          has_batch_dim=has_batch_dim,
       )
     else:
       return self._decode_state(  # pytype: disable=bad-return-type
-          state,
-          predicted_tokens=state.predicted_tokens,
+          state,  # pyrefly: ignore[bad-argument-type]
+          predicted_tokens=state.predicted_tokens,  # pyrefly: ignore[missing-attribute]
           has_batch_dim=has_batch_dim,
           return_state=return_state,
       )
+
+  def _initialize_sampler_loop(self, sampling) -> _sampler_loop.SamplerLoop:
+    """Initializes the sampler loop."""
+    return _sampler_loop.SamplerLoop(
+        # Static attributes. Changing those will trigger a recompilation.
+        model=self.model,
+        end_tokens=(
+            self.tokenizer.special_tokens.EOS,
+            self.tokenizer.special_tokens.END_OF_TURN,
+            self.tokenizer.special_tokens.BEGIN_OF_TOOL_RESPONSE,
+            *self._normalized_stop_tokens,
+        ),
+        forbidden_tokens=self._normalized_forbidden_tokens,
+        sampling=sampling,
+        cache_length=self.cache_length,
+        special_tokens=self.tokenizer.special_tokens,
+    )
 
   def _get_inputs(
       self,
@@ -404,13 +417,13 @@ class Sampler:
 
   def _tokenize_prompts(
       self,
-      prompt: str | Sequence[str],
+      prompt: _Prompt,
       *,
       add_bos: bool,
       pad_length: int | None = None,
-  ) -> Float['B L']:
+  ) -> Float['B L']:  # pyrefly: ignore[not-a-type]
     """Encode the prompts."""
-    prompt = _normalize_prompt(prompt)
+    prompt = _normalize_prompt(prompt, format=self.tokenizer.FORMAT)
     tokens = [self.tokenizer.encode(p, add_bos=add_bos) for p in prompt]
 
     # Notice that if pad_length exceeds the maximum length of the prompts,
@@ -428,7 +441,7 @@ class Sampler:
   def _decode_state(
       self,
       state: _sampler_loop.SamplingState,
-      predicted_tokens: Int['B L'],
+      predicted_tokens: Int['B L'],  # pyrefly: ignore[not-a-type]
       *,
       has_batch_dim: bool,
       return_state: bool,
@@ -437,12 +450,26 @@ class Sampler:
     # TODO(epot): Check that the text ends with an exit token (i.e. the
     # cache buffer hasn't been filled up).
 
+    # In multi-host, each host only has a slice of the data. We need to
+    # replicate the data, so each host can decode texts from all other hosts.
+    if jax.process_count() > 1:
+      predicted_tokens = kd.sharding.with_sharding_constraint(
+          predicted_tokens,
+          kd.sharding.REPLICATED,
+      )
+
     # Decode the logits.
     predicted_texts = [self.tokenizer.decode(t) for t in predicted_tokens]
 
     # # Unbatch the single prompts.
     if not has_batch_dim:
       (predicted_texts,) = predicted_texts
+
+    if state.cache_info.is_full.item():
+      kd.utils.status.log(
+          'Cache is full! Try increasing `Sampler.cache_length`. Current:'
+          f' {self.cache_length}'
+      )
 
     # Returns either text or detailed output.
     if return_state:
@@ -458,12 +485,13 @@ class Sampler:
       state_iter: Iterator[_sampler_loop.SamplingState],
       *,
       return_state: bool,
+      has_batch_dim: bool,
   ):
     for i, state in enumerate(state_iter):
       yield self._decode_state(
           state,
           predicted_tokens=state.predicted_tokens[..., i],
-          has_batch_dim=False,
+          has_batch_dim=has_batch_dim,
           return_state=return_state,
       )
 
@@ -486,9 +514,9 @@ class Sampler:
       return tuple(_normalize_token(self.tokenizer, t) for t in tokens)
 
 
-def _get_has_batch_dim(prompt: str | Sequence[str]) -> bool:
+def _get_has_batch_dim(prompt: _Prompt) -> bool:
   """Returns whether the prompt batched or not."""
-  if isinstance(prompt, str):
+  if isinstance(prompt, str | dialog.Conversation):
     return False
   elif _is_str_array(prompt):  # Scalar str array.
     assert isinstance(prompt, np.ndarray)
@@ -497,22 +525,28 @@ def _get_has_batch_dim(prompt: str | Sequence[str]) -> bool:
     return True
 
 
-def _normalize_prompt(prompt: str | Sequence[str]) -> list[str]:
+def _normalize_prompt(prompt: _Prompt, format: dialog.Format) -> list[str]:  # pylint: disable=redefined-builtin
   """Normalize the inputs."""
   if _is_str_array(prompt):  # Supports batched input array
     assert isinstance(prompt, np.ndarray)
     prompt = prompt.tolist()
 
-  if isinstance(prompt, str):
-    prompt = [prompt]
+  if isinstance(prompt, str | dialog.Conversation):
+    prompt = [prompt]  # pyrefly: ignore[bad-assignment]
   else:
-    prompt = list(prompt)
+    prompt = list(prompt)  # pyrefly: ignore[bad-assignment]
 
-  return prompt
+  # Normalize the prompt to strings.
+  prompt = [  # pyrefly: ignore[bad-assignment]
+      c.as_text(format=format) if isinstance(c, dialog.Conversation) else c
+      for c in prompt
+  ]
+
+  return prompt  # pyrefly: ignore[bad-return]
 
 
 def _normalize_images(
-    images: Sequence[UInt8['N? H W C']] | UInt8['N? H W C'] | None = None,
+    images: Sequence[UInt8['N? H W C']] | UInt8['N? H W C'] | None = None,  # pyrefly: ignore[not-a-type]
     *,
     has_batch_dim: bool,
 ) -> UInt8['B N H W C'] | None:
@@ -554,7 +588,7 @@ def _normalize_rng(seed_or_rng: PRNGKeyLike | None) -> PRNGKey:
   if seed_or_rng is None:
     seed_or_rng = py_random.randint(0, 1000000000)
   if not isinstance(seed_or_rng, jax.Array):
-    seed_or_rng = jax.random.key(seed_or_rng)
+    seed_or_rng = jax.random.key(seed_or_rng)  # pyrefly: ignore[bad-argument-type]
   return seed_or_rng
 
 
@@ -568,7 +602,7 @@ def _max_across_hosts(x: int) -> int:
   """Returns the maximum value across all hosts."""
   if jax.process_count() == 1:
     return x
-  x = jnp.asarray([x] * jax.local_device_count())
+  x = jnp.asarray([x] * jax.local_device_count())  # pyrefly: ignore[bad-assignment]
   x = _max_across_hosts_pmap(x)
   return x[0]
 

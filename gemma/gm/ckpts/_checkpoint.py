@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ else:
 
 # TODO(epot): Should be part of core Kauldron
 @dataclasses.dataclass(frozen=True)
-class LoadCheckpoint(kd.ckpts.AbstractPartialLoader):
+class LoadCheckpoint(kd.ckpts.InitTransform):
   """Loads weights from a Gemma checkpoint.
 
   Note: The checpoint only contains the Gemma transformer weights, not the
@@ -79,12 +79,16 @@ class _CheckpointType(enum.StrEnum):
       (e.g. `'{'transformer/layer_0/attn/_key_norm'' ...}`). The structure is
       very messy, but that's unfortunately how the official Gemma checkpoints
       where released.
+    STACKED: Internal checkpoint structure where params with the same attention
+      pattern are stored as stacked dict (e.g.
+      `{'transformer/embedder/layer_0/attn/_key_norm' ...}`).
     KAULDRON: Kauldron `kd.train.Trainer` checkpoint. Those checkpoints contains
       the optimizer state, step,... in addition to the params.
   """
 
   NESTED = enum.auto()
   FLAT = enum.auto()
+  STACKED = enum.auto()
   KAULDRON = enum.auto()
 
 
@@ -103,7 +107,9 @@ class _CheckpointTree:
   @functools.cached_property
   def type(self) -> _CheckpointType:
     """Structures of the checkpoint."""
-    if _is_flat_layout(self.tree):
+    if _is_stacked_layout(self.tree):
+      return _CheckpointType.STACKED
+    elif _is_flat_layout(self.tree):
       return _CheckpointType.FLAT
     elif _is_kauldron_layout(self.tree):
       return _CheckpointType.KAULDRON
@@ -113,6 +119,8 @@ class _CheckpointTree:
   @functools.cached_property
   def nested_tree(self) -> Params:
     """Returns the tree matching the NESTED checkpoint structure."""
+    if self.type == _CheckpointType.STACKED:
+      return _stacked_to_nested(self.tree)
     if self.type == _CheckpointType.FLAT:
       return _flat_to_nested(self.tree)
     elif self.type == _CheckpointType.KAULDRON:
@@ -129,7 +137,9 @@ class _CheckpointTree:
       tree = _remove_mm_params(tree)
     return _CheckpointTree(tree=tree)
 
-  def make_tree_for_params(self, params: _CheckpointTree) -> Params:
+  def make_tree_for_params(
+      self, params: _CheckpointTree
+  ) -> Params:
     """Returns the tree matching the checkpoint structure."""
     metadata = _wrap_skip(self)
 
@@ -140,6 +150,13 @@ class _CheckpointTree:
     if self.has_mm_params and not params.has_mm_params:
       ckpt_params = _add_skip_mm_params(ckpt_params, metadata)
 
+    # Reconcile known structural mismatches between model-init and
+    # checkpoint (e.g. Gemma4 LoRA: empty wrapper stubs from split_params,
+    # leaf-vs-dict format from nn.share_scope).  Only triggers when
+    # mismatches are detected; Gemma3/legacy paths are unchanged.
+    if _needs_reconciliation(ckpt_params, self.nested_tree):
+      ckpt_params = _reconcile_tree(ckpt_params, self.nested_tree)
+
     # 2. Reformat the nested tree to match the checkpoint structure.
     if self.type == _CheckpointType.NESTED:
       target_params = ckpt_params  # No need to reformat
@@ -148,29 +165,49 @@ class _CheckpointTree:
       target_params = _nested_to_flat(ckpt_params)
     elif self.type == _CheckpointType.KAULDRON:
       target_params = etree.copy(metadata.tree)
-      target_params['params'] = ckpt_params
+      target_params['params'] = ckpt_params  # pyrefly: ignore[unsupported-operation]
+    elif self.type == _CheckpointType.STACKED:
+      target_params = _nested_to_stacked(
+          ckpt_params, _compat.get_attention_pattern_len(self.tree)
+      )
     else:
       raise ValueError(f'Unsupported checkpoint structure: {self.type}')
 
-    return target_params
+    return target_params  # pyrefly: ignore[bad-return]
 
   @functools.cached_property
   def has_mm_params(self) -> bool:
-    return 'vision_encoder' in self.nested_tree
+    # Check for any known multimodal encoder (vision or audio).
+    return (
+        'vision_encoder' in self.nested_tree
+        or 'audio_encoder' in self.nested_tree
+    )
+
+  @functools.cached_property
+  def has_audio_input_embedding(self) -> bool:
+    return 'audio_input_embedding' in self.nested_tree.get('embedder', {})
 
 
 def save_params(
     params: Params,
     path: epath.PathLike,
+    *,
+    wait_until_finished: bool = False,
+    save_concurrent_gb: int | None = None,
 ) -> None:
   """Save the params to a checkpoint.
 
   Args:
     params: The params to save.
     path: The directory to which save the checkpoint.
+    wait_until_finished: If True, waits for the checkpoint save to complete
+      before returning.
+    save_concurrent_gb: Max concurrent GB allowed to be writing to disk.
   """
-  ckpt = ocp.StandardCheckpointer()
+  ckpt = ocp.StandardCheckpointer(save_concurrent_gb=save_concurrent_gb)
   ckpt.save(path, params)
+  if wait_until_finished:
+    ckpt.wait_until_finished()
 
 
 def load_params(
@@ -179,8 +216,9 @@ def load_params(
     params: Params | None = None,
     donate: bool = True,
     text_only: bool = False,
-    sharding: kd.sharding.ShardingTree | None = None,
+    sharding: kd.sharding.ShardingTree | None = None,  # pyrefly: ignore[not-a-type]
     quantize: bool = False,
+    restore_concurrent_gb: int | None = None,
 ) -> Params:
   """Restore the params from a checkpoint.
 
@@ -196,6 +234,7 @@ def load_params(
       is mutually exclusive with `params`.
     quantize: If `True`, the params will be mapped to enable quantization aware
       training.
+    restore_concurrent_gb: Max concurrent GB allowed to be restored.
 
   Returns:
     The restored params.
@@ -203,7 +242,7 @@ def load_params(
   if sharding is not None and params is not None:
     raise ValueError('`sharding` and `params` are mutually exclusive.')
 
-  ckpt = ocp.StandardCheckpointer()
+  ckpt = ocp.StandardCheckpointer(restore_concurrent_gb=restore_concurrent_gb)
 
   metadata, path = _get_metadata_and_path(ckpt, path)
 
@@ -219,12 +258,12 @@ def load_params(
     # checkpoint structure, so orbax restore as bfloat16 jax.Array, rather than
     # numpy arrays.
     # Params are always restored as NESTED
-    params = metadata.as_nested(remove_mm=text_only and metadata.has_mm_params)
+    params = metadata.as_nested(remove_mm=text_only and metadata.has_mm_params)  # pyrefly: ignore[bad-assignment]
     if sharding is not None:
       params = kd.sharding.with_sharding_constraint(params, sharding)
   else:
     # If params explicitly provided, use that
-    params = _CheckpointTree(tree=params)
+    params = _CheckpointTree(tree=params)  # pyrefly: ignore[bad-assignment]
     if params.type != _CheckpointType.NESTED:
       raise ValueError(
           'The input params provided to `load_params()` should be the raw'
@@ -246,7 +285,7 @@ def load_params(
   # Restore the params
   # To supports different checkpoint structures, the original params have to
   # be remapped into the checkpoint structure.
-  output_with_skip = metadata.make_tree_for_params(params)
+  output_with_skip = metadata.make_tree_for_params(params)  # pyrefly: ignore[bad-argument-type]
   restore_fn = functools.partial(ckpt.restore, path)
   output = _partial_restore(restore_fn, output_with_skip)
 
@@ -266,24 +305,51 @@ def load_params(
   # HACK: Manually cast the MM embedder params to f32, otherwise, image
   # produce wrong output on old GPUs (T4, V100)
   tree = output.tree
+  # TODO: b/441529595 - Update this if we need bfloat16 for audio input
+  # embedding.
+  if output.has_audio_input_embedding:
+    tree['embedder']['audio_input_embedding'] = jax.tree.map(
+        lambda x: x.astype(np.float32),
+        output.tree['embedder']['audio_input_embedding'],
+    )
+    if 'audio_input_projection' in tree.get('embedder', {}):
+      tree['embedder']['audio_input_projection'] = jax.tree.map(
+          lambda x: x.astype(np.float32),
+          output.tree['embedder']['audio_input_projection'],
+      )
+    if 'audio_soft_embedding_norm' in tree.get('embedder', {}):
+      tree['embedder']['audio_soft_embedding_norm'] = jax.tree.map(
+          lambda x: x.astype(np.float32),
+          output.tree['embedder']['audio_soft_embedding_norm'],
+      )
   if output.has_mm_params:
-    tree['embedder']['mm_input_projection'] = jax.tree.map(
-        lambda x: x.astype(np.float32),
-        output.tree['embedder']['mm_input_projection'],
-    )
-    tree['embedder']['mm_soft_embedding_norm'] = jax.tree.map(
-        lambda x: x.astype(np.float32),
-        output.tree['embedder']['mm_soft_embedding_norm'],
-    )
+    embedder = tree.get('embedder', {})
+    if 'mm_input_projection' in embedder:
+      tree['embedder']['mm_input_projection'] = jax.tree.map(
+          lambda x: x.astype(np.float32),
+          output.tree['embedder']['mm_input_projection'],
+      )
+    if 'mm_soft_embedding_norm' in embedder:
+      tree['embedder']['mm_soft_embedding_norm'] = jax.tree.map(
+          lambda x: x.astype(np.float32),
+          output.tree['embedder']['mm_soft_embedding_norm'],
+      )
   return tree
 
 
 # ======================== Structure reformat utils ========================
 
 
+def _stacked_to_nested(params: Params) -> Params:
+  """Reformat the params from STACKED to NESTED."""
+  params = etree.copy(params)  # pyrefly: ignore[bad-assignment]
+  params = _compat.unstack_params(params)
+  return _flat_to_nested(params)
+
+
 def _flat_to_nested(params: Params) -> Params:
   """Reformat the params from FLAT to NESTED."""
-  params = etree.copy(params)
+  params = etree.copy(params)  # pyrefly: ignore[bad-assignment]
   # Split the params for the MM and the transformer.
   transformer_params = {
       k: v for k, v in params.items() if k.startswith('transformer/')
@@ -302,18 +368,25 @@ def _flat_to_nested(params: Params) -> Params:
   return transformer_params
 
 
+def _nested_to_stacked(params: Params, attn_pattern_len: int) -> Params:
+  """Reformat the params from NESTED to STACKED."""
+  params = _nested_to_flat(params)
+  params = _compat.stack_params(params, attn_pattern_len)
+  return params
+
+
 def _nested_to_flat(params: Params) -> Params:
   """Reformat the params from NESTED to FLAT."""
-  params = etree.copy(params)  # Copy to allow mutating the tree.
+  params = etree.copy(params)  # Copy to allow mutating the tree.  # pyrefly: ignore[bad-assignment]
 
-  mm_params = params.pop('vision_encoder', {})
+  mm_params = params.pop('vision_encoder', {})  # pyrefly: ignore[missing-attribute]
   if mm_params:
     mm_params = _nested_to_flat_single(mm_params, name='SigLiPFromPatches_0')
 
   transformer_params = _nested_to_flat_single(params, name='transformer')
 
   # TODO(epot): Reshape the MM params too.
-  return transformer_params | mm_params
+  return transformer_params | mm_params  # pyrefly: ignore[unsupported-operation]
 
 
 def _nested_to_flat_single(params: Params, *, name: str) -> Params:
@@ -337,34 +410,171 @@ def _remove_mm_params(params):
   # TODO(epot): Once orbax supports partial restore, we would not need to
   # load those extra params in the first place.
 
-  del params['vision_encoder']
-  del params['embedder']['mm_input_projection']
-  del params['embedder']['mm_soft_embedding_norm']
+  # Vision params
+  if 'vision_encoder' in params:
+    del params['vision_encoder']  # pyrefly: ignore[unsupported-operation]
+  for k in ('mm_input_projection', 'mm_soft_embedding_norm',
+            'mm_pre_projection_norm', 'mm_input_embedding_extra'):
+    if k in params.get('embedder', {}):
+      del params['embedder'][k]  # pyrefly: ignore[bad-index, unsupported-operation]
+
+  # Audio params (Gemma4)
+  if 'audio_encoder' in params:
+    del params['audio_encoder']  # pyrefly: ignore[unsupported-operation]
+  for k in ('audio_input_projection', 'audio_soft_embedding_norm',
+            'audio_input_embedding', 'audio_input_embedding_extra'):
+    if k in params.get('embedder', {}):
+      del params['embedder'][k]  # pyrefly: ignore[bad-index, unsupported-operation]
+
   return params
 
 
 def _add_skip_mm_params(params: Params, metadata: _CheckpointTree) -> Params:
   """Add skip MM params to restore."""
-  params = etree.copy(params)
+  params = etree.copy(params)  # pyrefly: ignore[bad-assignment]
   params_with_mm = metadata.nested_tree
 
-  # Params should not be restored in the first place.
-  params['vision_encoder'] = params_with_mm['vision_encoder']
-  for k in (
+  # Known top-level multimodal encoder keys.
+  mm_top_level_keys = ('vision_encoder', 'audio_encoder')
+  # Known embedder-level multimodal projection/norm keys.
+  mm_embedder_keys = (
+      # Vision
       'mm_input_projection',
       'mm_soft_embedding_norm',
-  ):
-    params['embedder'][k] = params_with_mm['embedder'][k]
+      'mm_pre_projection_norm',
+      'mm_input_embedding_extra',
+      # Audio
+      'audio_input_projection',
+      'audio_soft_embedding_norm',
+      'audio_input_embedding',
+      'audio_input_embedding_extra',
+  )
+
+  for k in mm_top_level_keys:
+    if k in params_with_mm and k not in params:
+      params[k] = params_with_mm[k]  # pyrefly: ignore[unsupported-operation]
+
+  embedder_mm = params_with_mm.get('embedder', {})
+  for k in mm_embedder_keys:
+    if k in embedder_mm and k not in params.get('embedder', {}):
+      params['embedder'][k] = embedder_mm[k]
 
   return params
 
 
+def _needs_reconciliation(params: Params, metadata_tree: Params) -> bool:
+  """Returns True if the model params tree has known structural mismatches.
+
+  Detects two patterns that arise when LoRA interceptors interact with
+  models using ``nn.share_scope`` (e.g. Gemma4 FeedForward):
+
+  1. **Empty ``{}`` stubs** left by ``peft.split_params`` at LoRA wrapper
+     scopes (e.g. ``_LoRAEinsum_0``).  These keys exist in the model tree
+     but not in the checkpoint.
+  2. **Leaf-vs-dict format**: ``nn.share_scope`` flattens ``{'w': array}``
+     to bare ``ArrayImpl`` in the model-init tree, while the checkpoint
+     keeps the dict format.
+
+  This check is intentionally conservative — it returns ``False`` for
+  Gemma3 and legacy checkpoints, so their restore paths are unchanged.
+
+  Args:
+    params: The model-init params tree.
+    metadata_tree: The checkpoint metadata tree.
+
+  Returns:
+    True if structural mismatches are detected, False otherwise.
+  """
+  if not isinstance(params, dict) or not isinstance(metadata_tree, dict):
+    return False
+
+  for k, p_val in params.items():
+    if k not in metadata_tree:
+      # Key in model but not in checkpoint (e.g. LoRA stub).
+      if isinstance(p_val, dict) and not p_val:
+        return True
+      continue
+    m_val = metadata_tree[k]
+    # Leaf-vs-dict mismatch.
+    if not isinstance(p_val, dict) and isinstance(m_val, dict):
+      return True
+    # Recurse into sub-dicts.
+    if isinstance(p_val, dict) and isinstance(m_val, dict):
+      if _needs_reconciliation(p_val, m_val):
+        return True
+
+  return False
+
+
+def _reconcile_tree(params: Params, metadata_tree: Params) -> Params:
+  """Align model-init params tree to match checkpoint metadata structure.
+
+  Only called when :func:`_needs_reconciliation` returns ``True``.
+
+  Handles two known mismatches between ``model.init()`` and on-disk
+  checkpoints:
+
+  1. **Empty stubs**: LoRA wrappers (or other interceptors) may leave
+     empty dict scopes in the params tree that don't exist in the
+     checkpoint.  These are dropped.
+  2. **Leaf-vs-dict format**: ``nn.share_scope`` in Gemma4 ``FeedForward``
+     flattens ``{'w': array}`` to bare ``ArrayImpl`` during model init.
+     When the checkpoint stores ``{'w': array}``, the leaf is wrapped to
+     match.
+
+  Args:
+    params: The model-init params tree (may contain stubs / format
+      mismatches).
+    metadata_tree: The checkpoint metadata tree (ground-truth structure).
+
+  Returns:
+    A new params tree aligned to the checkpoint metadata structure.
+  """
+  if not isinstance(params, dict) or not isinstance(metadata_tree, dict):
+    return params
+
+  result = {}
+  for k in metadata_tree:
+    if k not in params:
+      # Key in checkpoint but not in model (e.g. MM params handled by
+      # _add_skip_mm_params separately) — skip.
+      continue
+    p_val = params[k]
+    m_val = metadata_tree[k]
+
+    if isinstance(p_val, dict) and isinstance(m_val, dict):
+      # Both dicts — recurse.
+      reconciled = _reconcile_tree(p_val, m_val)
+      if reconciled:  # Drop if empty after reconciliation.
+        result[k] = reconciled
+    elif not isinstance(p_val, dict) and isinstance(m_val, dict):
+      # Model has leaf (ArrayImpl), checkpoint has dict ({'w': ...}).
+      # Wrap the leaf to match checkpoint format.
+      if len(m_val) == 1:
+        inner_key = next(iter(m_val))
+        result[k] = {inner_key: p_val}
+      else:
+        result[k] = p_val  # Fallback: keep as-is.
+    else:
+      # Both leaves, or model has dict but checkpoint has leaf.
+      result[k] = p_val
+
+  # Keys in params but NOT in metadata are intentionally dropped.
+  # This strips LoRA wrapper stubs (_LoRAEinsum_0, etc.).
+  return result
+
+
 def _is_flat_layout(params: Params) -> bool:
   """Returns True is the structure is the legacy one."""
-  return all(
+  return (not _is_stacked_layout(params)) and all(
       k.startswith(('transformer/', 'SigLiPFromPatches_0/'))
       for k in params.keys()
   )
+
+
+def _is_stacked_layout(params: Params) -> bool:
+  """Returns True is the structure is the stacked one."""
+  return any(k.startswith('transformer/stacked_layers') for k in params.keys())
 
 
 def _is_kauldron_layout(params: Params) -> bool:

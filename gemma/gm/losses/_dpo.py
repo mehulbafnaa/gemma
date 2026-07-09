@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,9 @@ import jax
 import jax.numpy as jnp
 from kauldron import kd
 from kauldron import kontext
-from kauldron.typing import Bool, Dim, Float, Int, Schedule, typechecked  # pylint: disable=g-multiple-import,g-importing-member
+import kauldron.ktyping as kt
+from kauldron.ktyping import Bool, Float, Int, typechecked  # pylint: disable=g-multiple-import,g-importing-member
+from kauldron.typing import Schedule  # pylint: disable=g-multiple-import,g-importing-member
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -50,11 +52,11 @@ class DpoLoss(kd.losses.Loss):
   def get_values(
       self,
       *,
-      tokens: Int['*B N L'],
-      sequence_mask: Bool['*B N L'],
-      policy_logits: Float['*B N L V'],
-      anchor_logits: Float['*B N L V'],
-  ) -> Float['*B 1']:
+      tokens: Int['*B N L'],  # pyrefly: ignore[not-a-type]
+      sequence_mask: Bool['*B N L'],  # pyrefly: ignore[not-a-type]
+      policy_logits: Float['*B N L V'],  # pyrefly: ignore[not-a-type]
+      anchor_logits: Float['*B N L V'],  # pyrefly: ignore[not-a-type]
+  ) -> Float['*B 1']:  # pyrefly: ignore[not-a-type]
     """Computes the DPO loss."""
     # TODO(epot): Supports schedules for tau and label_smoothing !!!
 
@@ -81,8 +83,8 @@ class DpoLoss(kd.losses.Loss):
     # is done by the base class.
 
     dpo_loss = -(
-        jax.nn.log_sigmoid(po_delta) * (1 - self.label_smoothing)
-        + jax.nn.log_sigmoid(-po_delta) * self.label_smoothing
+        jax.nn.log_sigmoid(po_delta) * (1 - self.label_smoothing)  # pyrefly: ignore[unsupported-operation]
+        + jax.nn.log_sigmoid(-po_delta) * self.label_smoothing  # pyrefly: ignore[unsupported-operation]
     )
 
     return dpo_loss[..., None]  # Float['*B 1'] for Loss compatibility.
@@ -91,10 +93,10 @@ class DpoLoss(kd.losses.Loss):
 @typechecked
 def _get_logprobs_for_target(
     *,
-    logits: Float['*B N L V'],
-    targets: Int['*B N L'],
-    sequence_mask: Bool['*B N L'],
-) -> Float['*B N']:
+    logits: Float['*B N L V'],  # pyrefly: ignore[not-a-type]
+    targets: Int['*B N L'],  # pyrefly: ignore[not-a-type]
+    sequence_mask: Bool['*B N L'],  # pyrefly: ignore[not-a-type]
+) -> Float['*B N']:  # pyrefly: ignore[not-a-type]
   """Computes the per token xent given logits."""
   # We perform softmax in float32 to improve stability.
   logits = logits.astype(jnp.float32)

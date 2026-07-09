@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import dataclasses
 
 from gemma.gm.data import _functional
 from gemma.gm.nn import _config
-from gemma.gm.nn import _transformer
+from gemma.gm.nn import _transformer_like
 from gemma.gm.text import _sampler_loop
 from gemma.gm.text import _turn_utils
 from gemma.gm.typing import _common
@@ -29,7 +29,7 @@ from gemma.gm.utils import _types
 import jax
 from jax import numpy as jnp
 from kauldron import kd
-from kauldron.typing import Bool, Int, PRNGKey, UInt8  # pylint: disable=g-multiple-import,g-importing-member
+from kauldron.ktyping import Bool, Int, PRNGKey, UInt8  # pylint: disable=g-multiple-import,g-importing-member
 
 _PADDING_ID = 0
 
@@ -40,16 +40,16 @@ _PADDING_ID = 0
 class PrefillInput:
   """Input for the prefill phase."""
 
-  tokens: Int['B L']
+  tokens: Int['B L']  # pyrefly: ignore[not-a-type]
   images: UInt8['B N H W C'] | None
-  positions: Int['B L']
-  attention_mask: Bool['B L cache_length']
+  positions: Int['B L']  # pyrefly: ignore[not-a-type]
+  attention_mask: Bool['B L cache_length']  # pyrefly: ignore[not-a-type]
   cache: _cache_helper.Cache
 
 
 def prefill(
     *,
-    model: _transformer.Transformer,
+    model: _transformer_like.TransformerLike,
     params: _common.Params,
     input: _types.Input,  # pylint: disable=redefined-builtin
     last_state: _sampler_loop.SamplingState | None,
@@ -58,7 +58,11 @@ def prefill(
     max_out_length: int,
     pad_length: None | int | tuple[int, ...] = None,
     rng: PRNGKey,
-    sharding: kd.sharding.ShardingTree | None,
+    sharding: kd.sharding.ShardingTree | None,  # pyrefly: ignore[not-a-type]
+    vision_input=None,
+    audio=None,
+    audio_lengths=None,
+    audio_soft_token_counts=None,
 ) -> _sampler_loop.SamplingState:
   """Pre-fill the KV cache and initial model input.
 
@@ -75,6 +79,10 @@ def prefill(
     pad_length: The pad length for the prompt.
     rng: The random number generator.
     sharding: The sharding tree.
+    vision_input: PreprocessedVisionInput or None.
+    audio: Audio input data or None.
+    audio_lengths: Lengths of audio inputs or None.
+    audio_soft_token_counts: Soft token counts for audio or None.
 
   Returns:
     The initial state for the sampling loop.
@@ -103,36 +111,118 @@ def prefill(
       input=input,
       cache=full_cache,
       prev_turns=prev_turns,
-      pad_lengths=pad_length,
+      pad_lengths=pad_length,  # pyrefly: ignore[bad-argument-type]
+      vision_input=vision_input,
   )
 
-  # Call the model to fill up the cache.
-  out = model.apply(
-      {'params': params},
-      tokens=prefill_input.tokens,
-      images=prefill_input.images,
-      # Slice the cache to the prompt length, to avoid shape missmatch error.
-      cache=prefill_input.cache.cache,
-      positions=prefill_input.positions,
-      attention_mask=prefill_input.attention_mask,
-      return_last_only=True,
+  images_for_model = (
+      vision_input if vision_input is not None else prefill_input.images
   )
+  has_multimodal = images_for_model is not None or audio is not None
+  is_first_turn = not prev_turns
+
+  kwargs = {
+      'tokens': prefill_input.tokens,
+      'images': images_for_model,
+      'cache': prefill_input.cache.cache,
+      'positions': (
+          None
+          if (has_multimodal and is_first_turn)
+          else prefill_input.positions
+      ),
+      'attention_mask': (
+          None
+          if (has_multimodal and is_first_turn)
+          else prefill_input.attention_mask
+      ),
+      'return_last_only': True,
+  }
+  if audio is not None:
+    kwargs.update({
+        'audio': audio,
+        'audio_lengths': audio_lengths,
+        'audio_soft_token_counts': audio_soft_token_counts,
+    })
+  out = model.apply({'params': params}, **kwargs)  # pyrefly: ignore[unexpected-keyword]
 
   # TODO(epot): Could check whether the cache is full.
 
   # Write the new cache back to the full cache.
   cache = _merge_cache(
       full_cache=full_cache,
-      prefill_cache=out.cache,
+      prefill_cache=out.cache,  # pyrefly: ignore[missing-attribute]
   )
   del out
 
   # Set the end index (which indicates the last kv cache index used).
   # -1 because `_sample_loop` will re-start from the last prompt token.
   # Note this is smaller than `init_cache_length` as we remove the padding.
-  new_used_cache_length = (
-      prev_turns.used_cache_length + input.length_with_mm - 1
-  )
+  #
+  # Example: For input tokens batch like:
+  #
+  # [
+  #     [p0, p1, p2, 0, 0]
+  #     [p0, p1, 0, 0, 0]
+  #     [p0, p1, p2, p3, p4]
+  # ]
+  #
+  # During prefill, the cache is filled up:
+  #
+  # [
+  #     [kv0, kv1, kv2, 0, 0, 0, ...]
+  #     [kv0, kv1, 0, 0, 0, 0, ...]
+  #     [kv0, kv1, kv2, kv3, kv4, 0, ...]
+  # ]
+  #
+  # `length_with_mm == 5` but `used_cache_length == 4`, so the first sampling
+  # step will overwrite the last cache[4] values with the last prompt token:
+  #
+  # [
+  #     [kv0, kv1, kv2, 0, kv2, 0, ...]
+  #     [kv0, kv1, 0, 0, kv1, 0, ...]
+  #     [kv0, kv1, kv2, kv3, kv4, 0, ...]
+  # ]
+  #
+  # As you can see, the last token for padded sequence appears twice in the KV
+  # cache. However in practice, the attention mask ensures only one of those
+  # values is attended to.
+  # The attention for the first sampling step is:
+  #
+  # [
+  #     [1, 1, 1, 0, 0, 0, ...]
+  #     [1, 1, 0, 0, 0, 0, ...]
+  #     [1, 1, 1, 1, 1, 0, ...]
+  # ]
+  #
+  # So in practice, this means that the query of first sampling step will
+  # attend to the last prompt token computed during prefill, rather than
+  # itself (for padded sequences). But the two values should be identical
+  # (minus Jax precision errors ^^).
+  # For the second sampling step, the cache and attention mask will be:
+  #
+  # [
+  #     [kv0, kv1, kv2, 0, kv2, kv3, ...]
+  #     [kv0, kv1, 0, 0, kv1, kv2, ...]
+  #     [kv0, kv1, kv2, kv3, kv4, kv5, ...]
+  # ]
+  # [
+  #     [1, 1, 1, 0, 0, 1, ...]
+  #     [1, 1, 0, 0, 0, 1, ...]
+  #     [1, 1, 1, 1, 1, 1, ...]
+  # ]
+  #
+  # So the KV value computed during the first sampling step is never attended
+  # to for padded sequences.
+  #
+  # A cleaner implementation could be to have a per-batch cache index, to
+  # remove padding. But I leave this to my future self (or to future Gemini).
+
+  if hasattr(model, 'keep_last_prefill_kv') and model.keep_last_prefill_kv:
+    new_used_cache_length = prev_turns.used_cache_length + input.length_with_mm
+  else:
+    new_used_cache_length = (
+        prev_turns.used_cache_length + input.length_with_mm - 1
+    )
   cache = cache.set_end_index(new_used_cache_length)
 
   # TODO(epot): The first token was predicted, so could use this, but would
@@ -197,10 +287,10 @@ def _get_or_init_cache(
     *,
     inputs: _types.Input,
     prev_turns: _turn_utils.PrevTurns,
-    model: _transformer.Transformer,
+    model: _transformer_like.TransformerLike,
     params: _common.Params,
     cache_length: int,
-    sharding: kd.sharding.ShardingTree | None,
+    sharding: kd.sharding.ShardingTree | None,  # pyrefly: ignore[not-a-type]
 ) -> _cache_helper.Cache:
   """Initialize or reuse the cache."""
 
@@ -225,6 +315,7 @@ def _make_prefill_input(
     cache: _cache_helper.Cache,
     prev_turns: _turn_utils.PrevTurns,
     pad_lengths: tuple[int, ...],
+    vision_input=None,  # pylint: disable=unused-argument
 ) -> PrefillInput:
   """Make the transformer inputs for the prefill stage."""
   # Supports:
@@ -237,9 +328,7 @@ def _make_prefill_input(
   token_length_padded = _pad_to_bucket(input.length_with_mm, pad_lengths)
   input = input.pad(length_with_mm=token_length_padded)
 
-  # Cache length is equal to the pad token length + the previous turns.
   prefill_cache_length = prev_turns.used_cache_length + token_length_padded
-  # Pad the cache length, to avoid unecessary re-compilations.
   prefill_cache_length = _pad_to_bucket(prefill_cache_length, pad_lengths)
   cache = cache[:, :prefill_cache_length]
 
@@ -273,9 +362,9 @@ def _merge_cache(
     full_cache: _cache_helper.Cache,
     prefill_cache: _config.Cache,
 ) -> _cache_helper.Cache:
-  prefill_cache = _cache_helper.Cache(prefill_cache)
+  prefill_cache = _cache_helper.Cache(prefill_cache)  # pyrefly: ignore[bad-assignment]
 
-  return full_cache.at[:, : prefill_cache.total_cache_length].set_kv(
+  return full_cache.at[:, : prefill_cache.total_cache_length].set_kv(  # pyrefly: ignore[missing-attribute]
       prefill_cache
   )
 

@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,10 +28,22 @@ with _epy.lazy_api_imports(globals()):
   from gemma.gm.nn._gemma import Gemma2_9B
   from gemma.gm.nn._gemma import Gemma2_27B
   # Gemma 3
+  from gemma.gm.nn._gemma import Gemma3_270M
   from gemma.gm.nn._gemma import Gemma3_1B
   from gemma.gm.nn._gemma import Gemma3_4B
   from gemma.gm.nn._gemma import Gemma3_12B
   from gemma.gm.nn._gemma import Gemma3_27B
+  # Gemma 3n
+  from gemma.gm.nn.gemma3n._gemma3n import Gemma3n_E2B
+  from gemma.gm.nn.gemma3n._gemma3n import Gemma3n_E4B
+
+  # ****************************************************************************
+  # Gemma 4
+  # ****************************************************************************
+  from gemma.gm.nn.gemma4._gemma4 import Gemma4_E2B
+  from gemma.gm.nn.gemma4._gemma4 import Gemma4_E4B
+  from gemma.gm.nn.gemma4._gemma4 import Gemma4_31B
+  from gemma.gm.nn.gemma4._gemma4 import Gemma4_26B_A4B
 
   # ****************************************************************************
   # Wrapper (LoRA, quantization, DPO,...)
@@ -41,6 +53,7 @@ with _epy.lazy_api_imports(globals()):
   from gemma.gm.nn._quantization import IntWrapper
   from gemma.gm.nn._policy import AnchoredPolicy
   from gemma.gm.nn._transformer import Transformer
+  from gemma.gm.nn._transformer_like import TransformerLike
 
   # ****************************************************************************
   # Transformer building blocks
@@ -63,3 +76,5 @@ with _epy.lazy_api_imports(globals()):
   from gemma.gm.nn._policy import AnchoredPolicyOutput
 
   from gemma.gm.nn import config
+
+  from gemma.gm.nn.vision._vision import SigLiPFromPatches

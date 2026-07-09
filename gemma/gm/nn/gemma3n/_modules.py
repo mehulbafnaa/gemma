@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,11 +16,14 @@
 
 import enum
 from typing import List
+
 from flax import linen as nn
 from gemma.gm.math import _positional_embeddings
+from gemma.gm.nn import _modules
 from gemma.gm.nn.gemma3n import _layers
 import jax
 import jax.numpy as jnp
+
 
 K_MASK = -2.3819763e38  # Set to a large negative number.
 DEFAULT_ROPE_BASE_FREQUENCY = 10_000
@@ -29,8 +32,20 @@ DEFAULT_ROPE_SCALE_FACTOR = 1.0
 # A dictionary with the following array shapes as keys:
 # v: [batch_size, cache_size, num_heads, head_dim]
 # k: [batch_size, cache_size, num_heads, head_dim]
+# positions: [batch_size, cache_size]
 # end_index: [batch_size]
 LayerCache = dict[str, jax.Array]
+# Gemma 3n uses layer-shared KV caching (vertical, for current tokens) in
+# addition to context KV caching (horizontal, for previous tokens in sampling).
+# The data for both is shared and lives on the same LayerCache data structure.
+#
+# If context caching is disabled (the `cache` parameter is None):
+#   - Only layer-sharing is performed.
+#   - `cache_size` corresponds to `seq_len`.
+#   - `positions` and `end_index` are not used.
+# If context caching is enabled (the `cache` parameter is not None):
+#   - `cache_size` corresponds to `cache_len`.
+#   - `positions` stores token positions for sliding window attention.
 
 
 def _gaussian_topk(
@@ -49,66 +64,9 @@ def _gaussian_topk(
   return jax.nn.relu(inputs - cutoff_x)
 
 
-def _create_sliding_mask(
-    segment_pos: jnp.ndarray,
-    end_index: int,
-    cache_len: int,
-    sliding_window_size: int,
-):
-  """Creates mask for sliding window attention."""
-  total_tokens = end_index + segment_pos.shape[1]  # cached + processing tokens
-
-  def _reconstruct_rotated_cache_positions():
-    cache_positions = jnp.arange(cache_len) + total_tokens - cache_len
-    cache_positions = (
-        jnp.zeros_like(cache_positions)
-        # kv were placed at index (position_id % cache_len) in the cache.
-        .at[cache_positions % cache_len].set(cache_positions)
-    )
-    return cache_positions
-
-  # Reconstruct position_ids for cached kv.
-  cache_positions = jax.lax.cond(
-      total_tokens <= cache_len,
-      lambda: jnp.arange(cache_len),
-      _reconstruct_rotated_cache_positions,
-  )
-
-  cache_positions = cache_positions[None, None, :]  # [1, 1, cache_len]
-  segment_pos = segment_pos[:, :, None]  # [B, seq_len, 1]
-  sliding_mask = cache_positions > segment_pos - sliding_window_size
-  sliding_mask *= cache_positions < segment_pos + sliding_window_size
-  return sliding_mask
-
-
-def _create_sliding_mask_for_gemma_3n(
-    seq_len: int,
-    sliding_window_size: int,
-):
-  """Creates mask for sliding window attention."""
-  q_pos = jnp.arange(seq_len)[..., None]
-  kv_pos = jnp.arange(seq_len)[..., None, :]
-  q_pos = q_pos[..., None]
-  kv_pos = kv_pos[..., None, :]
-
-  # Allocate one extra element to the right context if window size is even.
-  dist = q_pos - kv_pos
-  left_window_size = (sliding_window_size - 1) // 2
-  right_window_size = sliding_window_size // 2
-  return jnp.squeeze(jnp.logical_or(
-      (dist >= 0) & (dist <= left_window_size),
-      (dist < 0) & (-dist <= right_window_size),
-  ))
-
-
 class AttentionType(enum.Enum):
   GLOBAL = 1
   LOCAL_SLIDING = 2
-
-
-class SlidingMaskType(enum.Enum):
-  DEFAULT = 1
-  GEMMA_3N = 2
 
 
 class Embedder(nn.Module):
@@ -238,7 +196,6 @@ class Attention(nn.Module):
   use_value_norm: bool = False
   scale_plus_one: bool = True
   guard_against_excess_precision: bool = False
-  sliding_mask_type: SlidingMaskType = SlidingMaskType.DEFAULT
 
   @property
   def use_qkv_einsum(self):
@@ -288,7 +245,7 @@ class Attention(nn.Module):
       segment_pos: jax.Array,
       cache: LayerCache | None,
       attn_mask: jax.Array,
-      kv_shared_cache: jax.Array | None = None,
+      kv_shared_cache: LayerCache | None = None,
   ) -> tuple[LayerCache | None, jax.Array]:
     """Applies multi-head attention to the inputs.
 
@@ -306,9 +263,18 @@ class Attention(nn.Module):
     if self.use_qkv_einsum:
       # [batch_size, seq_len, num_heads, head_dim]
       query_proj, key_proj, value_proj = self.qkv_einsum('BTD,SNDH->SBTNH', x)
+      if kv_shared_cache is not None:
+        # This cache includes layer-sharing KVs (vertical) and,
+        # if context caching is enabled, context KVs (horizontal).
+        # [batch_size, cache_size, num_heads, head_dim].
+        key_proj = kv_shared_cache['k']
+        value_proj = kv_shared_cache['v']
     else:
       query_proj = self.q_einsum('BTD,NDH->BTNH', x)
       if kv_shared_cache is not None:
+        # This cache includes layer-sharing KVs (vertical) and,
+        # if context caching is enabled, context KVs (horizontal).
+        # [batch_size, cache_size, num_heads, head_dim].
         key_proj = kv_shared_cache['k']
         value_proj = kv_shared_cache['v']
       else:
@@ -316,10 +282,12 @@ class Attention(nn.Module):
 
     if self.use_qk_norm:
       query_proj = self.query_norm(query_proj)
-      key_proj = self.key_norm(key_proj)
+      if kv_shared_cache is None:
+        key_proj = self.key_norm(key_proj)
 
     if self.use_value_norm:
-      value_proj = self.value_norm(value_proj)
+      if kv_shared_cache is None:
+        value_proj = self.value_norm(value_proj)
 
     query_proj = _positional_embeddings.apply_rope(
         query_proj,
@@ -329,30 +297,42 @@ class Attention(nn.Module):
     )
     query_scaled = query_proj * self.query_pre_attn_scalar
 
-    key_proj = _positional_embeddings.apply_rope(
-        key_proj,
-        segment_pos,
-        base_frequency=self.rope_base_frequency,
-        scale_factor=self.rope_scale_factor,
-    )
+    if kv_shared_cache is None:
+      key_proj = _positional_embeddings.apply_rope(
+          key_proj,
+          segment_pos,
+          base_frequency=self.rope_base_frequency,
+          scale_factor=self.rope_scale_factor,
+      )
 
     # Cache is left aligned.
     # Save the KV values to the cache.
     if cache is not None:
       end_index = cache['end_index'][0]
       cache_size = cache['v'].shape[1]
-      slice_indices = (0, end_index % cache_size, 0, 0)
+      update_index = end_index % cache_size
+      slice_indices = (0, update_index, 0, 0)
 
-      # [batch_size, cache_size, num_heads, head_dim]
-      value_proj = jax.lax.dynamic_update_slice(
-          cache['v'],
-          value_proj,
-          slice_indices,
-      )
+      if kv_shared_cache is None:
+        # [batch_size, cache_size, num_heads, head_dim]
+        value_proj = jax.lax.dynamic_update_slice(
+            cache['v'],
+            value_proj,
+            slice_indices,
+        )
 
-      # [batch_size, cache_size, num_heads, head_dim]
-      key_proj = jax.lax.dynamic_update_slice(
-          cache['k'], key_proj, slice_indices
+        # [batch_size, cache_size, num_heads, head_dim]
+        key_proj = jax.lax.dynamic_update_slice(
+            cache['k'],
+            key_proj,
+            slice_indices,
+        )
+
+      # [batch_size, cache_size]
+      cache_positions = jax.lax.dynamic_update_slice(
+          cache['positions'],
+          segment_pos,
+          slice_indices[:2],
       )
 
     if self.use_gqa:
@@ -378,22 +358,11 @@ class Attention(nn.Module):
         raise ValueError(
             'Sliding_window_size must be set if Local Sliding attention type'
         )
-      if self.sliding_mask_type == SlidingMaskType.DEFAULT:
-        sliding_mask = _create_sliding_mask(
-            segment_pos,
-            end_index=cache['end_index'][0] if cache is not None else 0,
-            # Derive cache length from attn_mask shape in case cache is None
-            cache_len=attn_mask.shape[-1],
-            sliding_window_size=self.sliding_window_size,
-        )
-      elif self.sliding_mask_type == SlidingMaskType.GEMMA_3N:
-        sliding_mask = _create_sliding_mask_for_gemma_3n(
-            seq_len=logits.shape[1],
-            sliding_window_size=self.sliding_window_size,
-        )
-      else:
-        raise ValueError(f'Unknown sliding_mask_type: {self.sliding_mask_type}')
-
+      sliding_mask = _modules.create_sliding_mask(
+          segment_pos,
+          cache_positions=cache_positions if cache else None,  # pylint: disable=undefined-variable  # pyrefly: ignore[unbound-name]
+          sliding_window_size=self.sliding_window_size,
+      )
       # [batch_size, seq_len, cache_size]
       attn_mask *= sliding_mask
 
@@ -424,24 +393,25 @@ class Attention(nn.Module):
       # [batch_size, seq_len, num_heads, head_dim]
       encoded = jnp.einsum('BTNS,BSNH->BTNH', probs, value_proj)
 
-    # TODO(gmenghani): Remove this.
-    no_attended_tokens = jnp.all(attn_mask == 0, axis=-1)[..., None, None]
-    encoded = jnp.where(no_attended_tokens, jnp.zeros_like(encoded), encoded)
-
     # [batch_size, seq_len, features]
     attn_output = self.attn_vec_einsum('BTNH,NHD->BTD', encoded)
 
+    # Always cache the layer-sharing KV.
+    # This also includes the context KV if cache is not None.
+    # i.e. cache_size can be == seq_len or == cache_len if cache is not None.
     new_cache = {
         # [batch_size, cache_size, num_heads, head_dim]
         'v': value_proj,
         # [batch_size, cache_size, num_heads, head_dim]
         'k': key_proj,
     }
-
+    # Remaining keys for context KV.
     if cache is not None:
       seq_len = x.shape[1]
       # [batch_size]
       new_cache['end_index'] = cache['end_index'] + seq_len
+      # [batch_size, cache_size]
+      new_cache['positions'] = cache_positions  # pylint: disable=undefined-variable
 
     return new_cache, attn_output
 
@@ -463,6 +433,8 @@ class Attention(nn.Module):
             (batch_size, cache_size, num_heads, head_dim), dtype=dtype
         ),
         'end_index': jnp.zeros((batch_size,), dtype=jnp.int32),
+        # Save the positions for the sliding window attention.
+        'positions': jnp.zeros((batch_size, cache_size), dtype=jnp.int32),
     }
 
 
@@ -704,7 +676,6 @@ class Block(nn.Module):
   kv_cache_sharing_pattern: int | None = None
   scale_plus_one: bool = True
   guard_against_excess_precision: bool = False
-  sliding_mask_type: SlidingMaskType = SlidingMaskType.DEFAULT
 
   def setup(self):
     self.pre_attention_norm = _layers.RMSNorm(
@@ -728,7 +699,6 @@ class Block(nn.Module):
         use_value_norm=self.use_value_norm,
         scale_plus_one=self.scale_plus_one,
         guard_against_excess_precision=self.guard_against_excess_precision,
-        sliding_mask_type=self.sliding_mask_type,
     )
 
     self.post_attention_norm = None
@@ -809,7 +779,7 @@ class Block(nn.Module):
     """
     predictions = [0.0]
     if self.use_altup:
-      predictions = self.altup.predict(x)
+      predictions = self.altup.predict(x)  # pyrefly: ignore[bad-argument-type]
       x = predictions[self.altup.active_idx]
     inputs_normalized = self.pre_attention_norm(x)
 
@@ -817,6 +787,7 @@ class Block(nn.Module):
     # cache["k"].shape = [batch_size, cache_size, num_heads, head_dim]
     # cache["v"].shape = [batch_size, cache_size, num_heads, head_dim]
     # cache["end_index"].shape = [batch_size]
+    # cache["positions"].shape = [batch_size, cache_size]
     cache, attn_output = self.attn(
         inputs_normalized,
         segment_pos,
@@ -834,7 +805,7 @@ class Block(nn.Module):
     if self.post_attention_norm is not None:
       attn_output = self.post_attention_norm(attn_output)
 
-    attn_output += x
+    attn_output += x  # pyrefly: ignore[unsupported-operation]
 
     if self.use_laurel:
       attn_output = (attn_output + laurel_out_normed) * jax.lax.rsqrt(2.0)
@@ -849,7 +820,7 @@ class Block(nn.Module):
     outputs += attn_output
 
     if self.use_altup:
-      outputs = self.altup.correct(predictions, outputs)
+      outputs = self.altup.correct(predictions, outputs)  # pyrefly: ignore[bad-argument-type]
 
     if self.per_layer_input_dim:
       gating_input = (
@@ -858,7 +829,7 @@ class Block(nn.Module):
           else self.altup.scale_corrected_output(outputs[0])
       )
       per_layer_inputs_mapped = self.per_layer_mapping(
-          gating_input, per_layer_input
+          gating_input, per_layer_input  # pyrefly: ignore[bad-argument-type]
       )
       if self.use_altup:  # outputs[0] is altup output, outputs[1:] inc PLI.
         for i in range(1, len(outputs)):

@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ from etils import epy
 import flax
 from gemma.gm.nn import _config
 import jax.numpy as jnp
-from kauldron.typing import Bool, Int  # pylint: disable=g-multiple-import
+from kauldron.ktyping import Bool, Int  # pylint: disable=g-multiple-import
 
 _Slice = slice | int
 _GetItem = _Slice | tuple[_Slice, ...]
@@ -71,7 +71,7 @@ class Cache:
     return _CacheProxyAt(self)
 
   @property
-  def end_index(self) -> Int['']:
+  def end_index(self) -> Int['']:  # pyrefly: ignore[not-a-type]
     """End index of the cache."""
     layer_data = next(iter(self.cache.values()))
     return layer_data['end_index'][0]
@@ -83,7 +83,7 @@ class Cache:
     )
 
   @property
-  def is_full(self) -> Bool['']:
+  def is_full(self) -> Bool['']:  # pyrefly: ignore[not-a-type]
     """Returns whether the cache is full."""
     # Maybe will lose the last token.
     return self.end_index >= self.total_cache_length - 1
@@ -142,12 +142,16 @@ def _map_cache_layer(cache, fn, **kwargs):
 def _slice_cache(layer_data, *, key: _GetItem):
   layer_data['k'] = layer_data['k'][*key, :, :]
   layer_data['v'] = layer_data['v'][*key, :, :]
+  layer_data['positions'] = layer_data['positions'][*key]
   return layer_data
 
 
 def _set_cache(layer_data0, layer_data1, *, key):
   layer_data0['k'] = layer_data0['k'].at[*key, :, :].set(layer_data1['k'])
   layer_data0['v'] = layer_data0['v'].at[*key, :, :].set(layer_data1['v'])
+  layer_data0['positions'] = (
+      layer_data0['positions'].at[*key].set(layer_data1['positions'])
+  )
   return layer_data0
 
 

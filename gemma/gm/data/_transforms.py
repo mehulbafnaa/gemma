@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ from gemma.gm.data import _functional
 from gemma.gm.text import _tokenizer
 from grain import python as grain
 from kauldron import kd
-from kauldron.typing import Array  # pylint: disable=g-multiple-import,g-importing-member
+from kauldron.ktyping import Array  # pylint: disable=g-multiple-import,g-importing-member
 
 
 @dataclasses.dataclass(kw_only=True, frozen=True)
@@ -97,7 +97,7 @@ class Pad(kd.data.ElementWiseTransform):
   truncate: bool = False
 
   # Do not @typechecked as `element` can be `list` too.
-  def map_element(self, element: Array["length"]) -> Array["max_length"]:
+  def map_element(self, element: Array["length"]) -> Array["max_length"]:  # pyrefly: ignore[not-a-type, unknown-name]
     return _functional.pad(
         element,
         max_length=self.max_length,

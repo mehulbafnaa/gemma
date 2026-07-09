@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -188,8 +188,8 @@ class SimulateQuantizedEinsum(nn.Module):
     kernel = simulate_quantize(
         kernel,
         self.method,
-        axis_to_reduce=get_axis_to_reduce_from_einsum_str(
-            einsum_str=self.wrapped.name
+        axis_to_reduce=get_axis_to_reduce_from_einsum_str(  # pyrefly: ignore[bad-argument-type]
+            einsum_str=self.wrapped.name  # pyrefly: ignore[bad-argument-type]
         ),
     )
 

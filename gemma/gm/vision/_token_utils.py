@@ -1,4 +1,4 @@
-# Copyright 2025 DeepMind Technologies Limited.
+# Copyright 2026 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,8 @@ import einops
 from gemma.gm.text import _tokenizer
 import jax
 import jax.numpy as jnp
-from kauldron.typing import Bool, Float, Int, typechecked  # pylint: disable=g-multiple-import,g-importing-member
+from kauldron.ktyping import Bool, Float, Int, typechecked  # pylint: disable=g-multiple-import,g-importing-member
+import numpy as np
 
 # `\n\n` token for Gemma3 tokenizer.
 _DOUBLE_NEW_LINE_TOKEN = 108
@@ -28,6 +29,7 @@ _DOUBLE_NEW_LINE_TOKEN = 108
 # vision encoder.
 # This should never be manipulated by the end-user.
 SOFT_TOKEN_PLACEHOLDER = -2
+AUDIO_SOFT_TOKEN_PLACEHOLDER = -4
 
 
 def get_num_mm_tokens(
@@ -43,7 +45,7 @@ def get_num_mm_tokens(
 
 @typechecked
 def add_extra_tokens_for_images(
-    tokens: Int['B L'],
+    tokens: Int['B L'],  # pyrefly: ignore[not-a-type]
     *,
     max_num_images: int,
     num_tokens_per_image: int,
@@ -88,7 +90,7 @@ def add_extra_tokens_for_images(
   ]
 
   return insert_sequence(
-      at=special_tokens.START_OF_IMAGE,
+      at=special_tokens.IMAGE_PLACEHOLDER,
       sequence=mm_tokens,
       tokens=tokens,
       max_num_images=max_num_images,
@@ -96,12 +98,12 @@ def add_extra_tokens_for_images(
 
 
 def insert_sequence(
-    tokens: Int['B L'],
+    tokens: Int['B L'],  # pyrefly: ignore[not-a-type]
     *,
     at: int,
-    sequence: Int['L'],
+    sequence: Int['L'],  # pyrefly: ignore[not-a-type, unknown-name]
     max_num_images: int,
-) -> Int['B L']:
+) -> Int['B L']:  # pyrefly: ignore[not-a-type]
   """Insert a sequence of tokens at a given position."""
   _, length = tokens.shape
 
@@ -145,11 +147,11 @@ def insert_sequence(
 
 def _get_new_text_tokens(
     *,
-    mm_start: Bool['B L'],
-    text_tokens: Int['B L'],
+    mm_start: Bool['B L'],  # pyrefly: ignore[not-a-type]
+    text_tokens: Int['B L'],  # pyrefly: ignore[not-a-type]
     offset_by: int,
     length_with_mm: int,
-) -> Int['B max_num_images num_tokens_per_image+4']:
+) -> Int['B max_num_images num_tokens_per_image+4']:  # pyrefly: ignore[not-a-type]
   # Jax vmap does not support positional arguments, so need the
   # _get_new_text_tokens_inner indirection.
   return jax.vmap(_get_new_text_tokens_inner, in_axes=(0, 0, None, None))(
@@ -158,11 +160,11 @@ def _get_new_text_tokens(
 
 
 def _get_new_text_tokens_inner(
-    mm_start: Bool['B L'],
-    text_tokens: Int['B L'],
+    mm_start: Bool['B L'],  # pyrefly: ignore[not-a-type]
+    text_tokens: Int['B L'],  # pyrefly: ignore[not-a-type]
     offset_by: int,
     length_with_mm: int,
-) -> Int['L']:
+) -> Int['L']:  # pyrefly: ignore[not-a-type, unknown-name]
   """`_get_new_text_tokens_positions` without batch dimension."""
 
   # Empty buffer in which text and MM tokens will be inserted.
@@ -188,9 +190,9 @@ def _get_new_text_tokens_inner(
 
 def _get_new_text_tokens_positions(
     *,
-    offset_on: Bool['L'],
+    offset_on: Bool['L'],  # pyrefly: ignore[not-a-type, unknown-name]
     offset_by: int,
-) -> Int['L']:
+) -> Int['L']:  # pyrefly: ignore[not-a-type, unknown-name]
   """Create the positions of the new tokens.
 
   Input: `[x, x, x, offset_on, x, x, offset_on, x]`
@@ -213,12 +215,12 @@ def _get_new_text_tokens_positions(
 
 def _get_new_mm_tokens(
     *,
-    mm_start: Bool['B L'],
-    mm_tokens_to_insert: Int['num_tokens_per_image+4'],
+    mm_start: Bool['B L'],  # pyrefly: ignore[not-a-type]
+    mm_tokens_to_insert: Int['num_tokens_per_image+4'],  # pyrefly: ignore[not-a-type, unknown-name]
     max_num_images: int,
     offset_by: int,
     length_with_mm: int,
-) -> Int['B max_num_images num_tokens_per_image+4']:
+) -> Int['B max_num_images num_tokens_per_image+4']:  # pyrefly: ignore[not-a-type]
   # Jax vmap does not support positional argiments, so need the
   # _get_new_mm_tokens_inner indirection.
   return jax.vmap(
@@ -227,12 +229,12 @@ def _get_new_mm_tokens(
 
 
 def _get_new_mm_tokens_inner(
-    mm_start: Bool['L'],
-    mm_tokens_to_insert: Int['num_tokens_per_image+4'],
+    mm_start: Bool['L'],  # pyrefly: ignore[not-a-type, unknown-name]
+    mm_tokens_to_insert: Int['num_tokens_per_image+4'],  # pyrefly: ignore[not-a-type, unknown-name]
     max_num_images: int,
     offset_by: int,
     length_with_mm: int,
-) -> Int['max_num_images num_tokens_per_image+4']:
+) -> Int['max_num_images num_tokens_per_image+4']:  # pyrefly: ignore[not-a-type]
   """`_get_new_mm_tokens` without batch dimension."""
   # Empty buffer row, which will be merged with the final tokens.
   row = jnp.zeros((length_with_mm,), dtype=jnp.int32)
@@ -268,10 +270,10 @@ def _get_new_mm_tokens_inner(
 @typechecked
 def merge_embeddings(
     *,
-    text_embeddings: Float['B L D'],
-    vision_embeddings: Float['B N P D'],
-    mask: Bool['B L'],
-) -> Float['B L D']:
+    text_embeddings: Float['B L D'],  # pyrefly: ignore[not-a-type]
+    vision_embeddings: Float['B N P D'],  # pyrefly: ignore[not-a-type]
+    mask: Bool['B L'],  # pyrefly: ignore[not-a-type]
+) -> Float['B L D']:  # pyrefly: ignore[not-a-type]
   """Merge the text and vision embeddings."""
   return jax.vmap(_merge_embeddings_inner, in_axes=(0, 0, 0))(
       text_embeddings, vision_embeddings, mask
@@ -279,10 +281,10 @@ def merge_embeddings(
 
 
 def _merge_embeddings_inner(
-    text_embeddings: Float['L D'],
-    vision_embeddings: Float['N P D'],
-    mask: Bool['L'],
-) -> Float['L D']:
+    text_embeddings: Float['L D'],  # pyrefly: ignore[not-a-type]
+    vision_embeddings: Float['N P D'],  # pyrefly: ignore[not-a-type]
+    mask: Bool['L'],  # pyrefly: ignore[not-a-type, unknown-name]
+) -> Float['L D']:  # pyrefly: ignore[not-a-type]
   """`merge_embeddings` without batch dimension."""
 
   vision_embeddings = einops.rearrange(
@@ -303,13 +305,52 @@ def _merge_embeddings_inner(
   return merged
 
 
+def merge_flat_embeddings(
+    *,
+    text_embeddings: Float['B L D'],  # pyrefly: ignore[not-a-type]
+    multimodal_embeddings: Float['B T D'],  # pyrefly: ignore[not-a-type]
+    mask: Bool['B L'],  # pyrefly: ignore[not-a-type]
+) -> Float['B L D']:  # pyrefly: ignore[not-a-type]
+  return jax.vmap(_merge_flat_embeddings_inner, in_axes=(0, 0, 0))(
+      text_embeddings, multimodal_embeddings, mask
+  )
+
+
+def _merge_flat_embeddings_inner(
+    text_embeddings: Float['L D'],  # pyrefly: ignore[not-a-type]
+    multimodal_embeddings: Float['T D'],  # pyrefly: ignore[not-a-type]
+    mask: Bool['L'],  # pyrefly: ignore[not-a-type, unknown-name]
+) -> Float['L D']:  # pyrefly: ignore[not-a-type]
+  """Merges flattened vision embeddings into text embeddings.
+
+  Args:
+    text_embeddings: The text embeddings of shape [L, D].
+    multimodal_embeddings: The flattened multimodal embeddings of shape [T, D],
+      where T is the total number of vision/audio tokens across all images.
+    mask: A boolean mask of shape [L], indicating the positions in
+      `text_embeddings` where the vision/audio embeddings should be inserted.
+
+  Returns:
+    The merged embeddings of shape [L, D].
+  """
+  target_pos = jnp.nonzero(mask, size=multimodal_embeddings.shape[0])
+
+  first_pos = text_embeddings[0]
+
+  merged = text_embeddings.at[target_pos, :].set(multimodal_embeddings)
+
+  merged = merged.at[0].set(first_pos)
+
+  return merged
+
+
 @typechecked
 def remove_mm_logits(
     *,
-    logits: Float['B L V'],
-    tokens: Int['B L_no_mm'],
+    logits: Float['B L V'],  # pyrefly: ignore[not-a-type]
+    tokens: Int['B L_no_mm'],  # pyrefly: ignore[not-a-type]
     num_tokens_per_image: int,
-) -> Float['B L_no_mm V']:
+) -> Float['B L_no_mm V']:  # pyrefly: ignore[not-a-type]
   """Remove the logits which are not MM."""
 
   # TODO(epot): This value should be propagated from the model.
@@ -323,3 +364,118 @@ def remove_mm_logits(
   )
 
   return jnp.take_along_axis(logits, new_text_tokens_pos[..., None], axis=1)
+
+
+def get_num_variable_mm_tokens(
+    soft_token_counts: list[int],
+) -> int:
+  return sum(count + 3 for count in soft_token_counts)
+
+
+def add_variable_extra_tokens_for_images(
+    tokens: np.ndarray,
+    *,
+    soft_token_counts: list[int],
+) -> np.ndarray:
+  r"""Expand `IMAGE_PLACEHOLDER` with a variable number of placeholders.
+
+  Unlike `add_extra_tokens_for_images`, each image can produce a different
+  number of soft tokens, determined by `soft_token_counts`.
+
+  This operates at the NumPy level (before JIT) because different images
+  have different expansion sizes.
+
+  Example with soft_token_counts=[3, 2]:
+
+  ```python
+  input = [..., x, <|image|>, y, <|image|>, z, ...]
+  output = [
+      ..., x, \n\n, <|image>, P, P, P, <image|>, \n\n,
+      y, \n\n, <|image>, P, P, P, <image|>, \n\n, z, ...
+  ]
+  ```
+
+  Args:
+    tokens: Text tokens, shape [B, L]. NumPy array.
+    soft_token_counts: Number of soft tokens per image, in order of appearance.
+
+  Returns:
+    Expanded tokens as np.ndarray with shape [B, L_expanded].
+  """
+  special_tokens = _tokenizer.Gemma4Tokenizer.special_tokens
+  placeholder_token = special_tokens.IMAGE_PLACEHOLDER
+  start_token = special_tokens.START_OF_IMAGE
+  end_token = special_tokens.END_OF_IMAGE
+
+  batch_size = tokens.shape[0]
+  results = []
+  for b in range(batch_size):
+    row = tokens[b].tolist()
+    expanded = []
+    image_idx = 0
+    for token in row:
+      if token == placeholder_token and image_idx < len(soft_token_counts):
+        count = soft_token_counts[image_idx]
+        expanded.append(_DOUBLE_NEW_LINE_TOKEN)
+        expanded.append(start_token)
+        expanded.extend([SOFT_TOKEN_PLACEHOLDER] * count)
+        expanded.append(end_token)
+        expanded.append(_DOUBLE_NEW_LINE_TOKEN)
+        image_idx += 1
+      else:
+        expanded.append(token)
+    results.append(expanded)
+
+  max_len = max(len(r) for r in results)
+  padded = np.zeros((batch_size, max_len), dtype=np.int32)
+  for b, row in enumerate(results):
+    padded[b, : len(row)] = row
+
+  return padded
+
+
+def add_variable_extra_tokens_for_audio(
+    tokens: np.ndarray,
+    *,
+    soft_token_counts: list[int],
+) -> np.ndarray:
+  """Expand `AUDIO_PLACEHOLDER` with a variable number of placeholders.
+
+  This operates at the NumPy level (before JIT) because different audio
+  clips can have different expansion sizes.
+
+  Args:
+    tokens: Text tokens, shape [B, L]. NumPy array.
+    soft_token_counts: Number of soft tokens per audio, in order of appearance.
+
+  Returns:
+    Expanded tokens as np.ndarray with shape [B, L_expanded].
+  """
+  special_tokens = _tokenizer.Gemma4Tokenizer.special_tokens
+  placeholder_token = special_tokens.AUDIO_PLACEHOLDER
+  start_token = special_tokens.START_OF_AUDIO
+  end_token = special_tokens.END_OF_AUDIO
+
+  batch_size = tokens.shape[0]
+  results = []
+  for b in range(batch_size):
+    row = tokens[b].tolist()
+    expanded = []
+    audio_idx = 0
+    for token in row:
+      if token == placeholder_token and audio_idx < len(soft_token_counts):
+        count = soft_token_counts[audio_idx]
+        expanded.append(start_token)
+        expanded.extend([AUDIO_SOFT_TOKEN_PLACEHOLDER] * count)
+        expanded.append(end_token)
+        audio_idx += 1
+      else:
+        expanded.append(token)
+    results.append(expanded)
+
+  max_len = max(len(r) for r in results)
+  padded = np.zeros((batch_size, max_len), dtype=np.int32)
+  for b, row in enumerate(results):
+    padded[b, : len(row)] = row
+
+  return padded
